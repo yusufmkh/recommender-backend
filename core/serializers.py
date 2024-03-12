@@ -68,7 +68,7 @@ class AttachmentRequirementSerializer(serializers.ModelSerializer):
 
 class AttachmentAnswerSerializer(serializers.ModelSerializer):
   class Meta:
-    model = ApplicationAnswer
+    model = AttachmentAnswer
     fields = ['id', 'attachment_requirement', 'attachment']
 
 class ConversationSerializer(serializers.ModelSerializer):
