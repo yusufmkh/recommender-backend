@@ -86,30 +86,6 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   def __str__(self):
     return self.user_name
   
-class Job(models.Model):
-  company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True)
-  title = models.CharField(max_length=100)
-  description = models.TextField()
-  job_type = models.CharField(max_length=200, null=True)
-  pay = models.CharField(max_length=200, null=True)
-  pay_range = models.CharField(
-    max_length=20,
-    choices=PAY_RANGE_OPTIONS,
-    default='pay20_30'
-    )
-  status = models.CharField(
-    max_length=1,
-    choices=JOB_STATUSES,
-    default='a'
-    )
-  contact = models.CharField(max_length=100, null=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
-  
-
-  def __str__(self):
-    return self.title
-  
 class Company(models.Model):
   user = models.ForeignKey(get_user_model(), on_delete=models.CASCADE)
   name = models.CharField(max_length=100)
@@ -139,10 +115,35 @@ class Company(models.Model):
   def __str__(self):
     return self.name
 
+class Job(models.Model):
+  company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True)
+  title = models.CharField(max_length=100)
+  description = models.TextField()
+  job_type = models.CharField(max_length=200, null=True)
+  pay = models.CharField(max_length=200, null=True)
+  pay_range = models.CharField(
+    max_length=20,
+    choices=PAY_RANGE_OPTIONS,
+    default='pay20_30'
+    )
+  status = models.CharField(
+    max_length=1,
+    choices=JOB_STATUSES,
+    default='a'
+    )
+  contact = models.CharField(max_length=100, null=True)
+  created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
+  
+
+  def __str__(self):
+    return self.title
+
 def get_company_name():
   return Company.objects.get('name')
 
 class WorkExperience(models.Model):
+  user = models.ForeignKey(get_user_model(), on_delete=models.CASCADE)
   company = models.ForeignKey(Company, on_delete=models.SET(get_company_name), blank=True, null=True, default=None)
   job_title = models.CharField(max_length=100)
   description = models.TextField()
@@ -155,7 +156,7 @@ class WorkExperience(models.Model):
   updated_at = models.DateTimeField(auto_now=True)
 
 class Skill(models.Model):
-  workexperience = models.ManyToManyField(WorkExperience)
+  work_experience = models.ManyToManyField(WorkExperience)
   name = models.CharField(max_length=100)
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
@@ -205,6 +206,8 @@ class Application(models.Model):
     choices=APPLICATION_STATUSES,
     default='a'
     )
+  created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
 
 class ApplicationQuestion(models.Model):
   application = models.ForeignKey(Application, on_delete=models.CASCADE)
