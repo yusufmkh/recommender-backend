@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import MyUser
+from .models import MyUser, Job, Company, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
 class UserAdminConfig(UserAdmin):
   search_fields = ('email', 'user_name', 'first_name', 'last_name')
@@ -19,3 +19,19 @@ class UserAdminConfig(UserAdmin):
   )
 
 admin.site.register(MyUser, UserAdminConfig)
+admin.site.register(Job)
+admin.site.register(Company)
+admin.site.register(WorkExperience)
+admin.site.register(Skill)
+admin.site.register(Preference)
+admin.site.register(SavedJob)
+admin.site.register(SavedCandidate)
+admin.site.register(Match)
+admin.site.register(Application)
+admin.site.register(ApplicationQuestion)
+admin.site.register(ApplicationAnswer)
+admin.site.register(AttachmentRequirement)
+admin.site.register(AttachmentAnswer)
+admin.site.register(Conversation)
+admin.site.register(Message)
+admin.site.register(MessageFile)
