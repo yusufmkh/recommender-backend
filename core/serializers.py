@@ -4,84 +4,84 @@ from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, Sav
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
     model = MyUser
-    fields = ['id', 'first_name', 'last_name', 'email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'is_staff', 'is_active', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class CompanySerializer(serializers.ModelSerializer):
   class Meta:
     model = Company
-    fields = ['id', 'user', 'name', 'legal_name', 'email', 'photo', 'type', 'size', 'phone_number', 'website', 'address', 'postcode', 'city', 'state', 'country', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class JobSerializer(serializers.ModelSerializer):
   class Meta:
     model = Job
-    fields = ['id', 'company', 'title', 'description', 'job_type', 'pay', 'pay_range', 'status', 'contact', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class WorkExperienceSerializer(serializers.ModelSerializer):
   class Meta:
     model = WorkExperience
-    fields = ['id', 'user', 'company', 'job_title', 'description', 'company_name', 'company_address', 'company_website', 'start_date', 'end_date', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class SkillSerializer(serializers.ModelSerializer):
   class Meta:
     model = Skill
-    fields = ['id', 'work_experience', 'name', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class PreferenceSerializer(serializers.ModelSerializer):
   class Meta:
     model = Preference
-    fields = ['id', 'user', 'job_type', 'company_type', 'company_size', 'pay_range', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class SavedJobSerializer(serializers.ModelSerializer):
   class Meta:
     model = SavedJob
-    fields = ['id', 'user', 'job']
+    fields = '__all__'
 
 class SavedCandidateSerializer(serializers.ModelSerializer):
   class Meta:
     model = SavedCandidate
-    fields = ['id', 'company', 'job', 'user']
+    fields = '__all__'
 
 class MatchSerializer(serializers.ModelSerializer):
   class Meta:
     model = Match
-    fields = ['id', 'user', 'job', 'is_invited', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class ApplicationSerializer(serializers.ModelSerializer):
   class Meta:
     model = Application
-    fields = ['id', 'user', 'job', 'status', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class ApplicationQuestionSerializer(serializers.ModelSerializer):
   class Meta:
     model = ApplicationQuestion
-    fields = ['id', 'application', 'question']
+    fields = '__all__'
 
 class ApplicationAnswerSerializer(serializers.ModelSerializer):
   class Meta:
     model = ApplicationAnswer
-    fields = ['id', 'application_question', 'answer']
+    fields = '__all__'
 
 class AttachmentRequirementSerializer(serializers.ModelSerializer):
   class Meta:
     model = AttachmentRequirement
-    fields = ['id', 'application', 'requirement', 'attachment_type']
+    fields = '__all__'
 
 class AttachmentAnswerSerializer(serializers.ModelSerializer):
   class Meta:
     model = AttachmentAnswer
-    fields = ['id', 'attachment_requirement', 'attachment']
+    fields = '__all__'
 
 class ConversationSerializer(serializers.ModelSerializer):
   class Meta:
     model = Conversation
-    fields = ['id', 'creator', 'recipient', 'job', 'created_at']
+    fields = '__all__'
 
 class MessageSerializer(serializers.ModelSerializer):
   class Meta:
     model = Message
-    fields = ['id', 'conversation', 'sender', 'message', 'created_at', 'updated_at']
+    fields = '__all__'
 
 class MessageFileSerializer(serializers.ModelSerializer):
   class Meta:
     model = MessageFile
-    fields = ['id', 'message', 'file_link']
+    fields = '__all__'
