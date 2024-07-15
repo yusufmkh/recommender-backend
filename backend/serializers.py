@@ -4,27 +4,33 @@ from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, Sav
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
     model = MyUser
-    fields = '__all__'
+    fields = ['id', 'first_name', 'last_name', 'email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
 
 class CompanySerializer(serializers.ModelSerializer):
   class Meta:
     model = Company
     fields = '__all__'
 
-class JobSerializer(serializers.ModelSerializer):
-  class Meta:
-    model = Job
-    fields = '__all__'
-
-class WorkExperienceSerializer(serializers.ModelSerializer):
-  class Meta:
-    model = WorkExperience
-    fields = '__all__'
-
 class SkillSerializer(serializers.ModelSerializer):
   class Meta:
     model = Skill
     fields = '__all__'
+
+class JobSerializer(serializers.ModelSerializer):
+  skills = SkillSerializer(many=True)
+
+  class Meta:
+    model = Job
+    fields = '__all__'
+    depth = 1
+
+class WorkExperienceSerializer(serializers.ModelSerializer):
+  skills = SkillSerializer(many=True)
+
+  class Meta:
+    model = WorkExperience
+    fields = '__all__'
+    depth = 1
 
 class PreferenceSerializer(serializers.ModelSerializer):
   class Meta:
