@@ -3,8 +3,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from backend import recommendermodel
-
 from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
 from .serializers import MyUserSerializer, CompanySerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
@@ -179,22 +177,9 @@ def jobs(request, format=None):
     
     job_serializer = JobSerializer(job)
 
-    candidate_predictions = recommendermodel.predict(
-      data={
-        "id": len(jobs_data) + 1,
-        "company_type": company_data['company_type'],
-        "company_size": company_data['company_size'],
-        "job_type": job_data['job_type'],
-        "pay_range": job_data['pay_range'],
-        "skills": job_skills
-      },
-      input_type='job',
-      current_user=request.user
-    )
-
     return Response({
       "job": job_serializer.data,
-      "candidate_predictions": candidate_predictions
+      "candidate_predictions": 'Candidate predictions here',
       }, status=status.HTTP_201_CREATED)
 
 @api_view(['GET', 'PUT', 'DELETE'])
