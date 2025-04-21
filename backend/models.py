@@ -25,11 +25,6 @@ APPLICATION_STATUSES = (
   ('r', 'Rejected'),
   )
 
-COMPANY_TYPES = (
-  ('restaurant', 'Restaurant'),
-  ('hotel', 'Hotel'),
-)
-
 COMPANY_SIZES = (
   ('small', 'up to 100 employees'),
   ('medium', 'from 100 to 1000 employees'),
@@ -93,11 +88,6 @@ class Company(models.Model):
   legal_name = models.CharField(max_length=100, blank=True)
   email = models.EmailField(max_length=254)
   photo = models.CharField(max_length=500, blank=True)
-  company_type = models.CharField(
-    max_length=30,
-    choices=COMPANY_TYPES,
-    default='restaurant'
-    )
   company_size = models.CharField(
     max_length=6,
     choices=COMPANY_SIZES,
@@ -171,11 +161,6 @@ class WorkExperience(models.Model):
 class Preference(models.Model):
   user = models.OneToOneField(get_user_model(), related_name='preferences', on_delete=models.CASCADE)
   job_type = models.CharField(max_length=200, null=True)
-  company_type = models.CharField(
-    max_length=30,
-    choices=COMPANY_TYPES,
-    default='restaurant'
-    )
   company_size = models.CharField(
     max_length=6,
     choices=COMPANY_SIZES,
