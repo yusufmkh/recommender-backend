@@ -107,19 +107,27 @@ def user_skills(request):
 @permission_classes([IsAuthenticated])
 def user_preferences(request):
   if request.method == 'GET':
-    user_preferences = Preference.objects.filter(user=request.user)
+    preference = Preference.objects.filter(user=request.user).first()
 
-    user_preferences_serializer = PreferenceSerializer(user_preferences, many=True)
+    if not preference:
+      return Response(None)
 
-    return Response(user_preferences_serializer.data)
+    return Response(PreferenceSerializer(preference).data)
   
   elif request.method == 'POST':
-    user_preferences_serializer = PreferenceSerializer(data={'user': request.user.id, **request.data})
+    existing = Preference.objects.filter(user=request.user).first()
+
+    user_preferences_serializer = PreferenceSerializer(
+      existing,
+      data={'user': request.user.id, **request.data},
+      partial=bool(existing)
+    )
 
     if user_preferences_serializer.is_valid():
       user_preferences_serializer.save()
 
-      return Response(user_preferences_serializer.data, status=status.HTTP_201_CREATED)
+      status_code = status.HTTP_200_OK if existing else status.HTTP_201_CREATED
+      return Response(user_preferences_serializer.data, status=status_code)
     else:
       return Response(user_preferences_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
