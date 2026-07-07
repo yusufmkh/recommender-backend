@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path("api/user_register/", views.user_register, name="user_register"),
     path("api/user_dashboard/", views.user_dashboard, name="user_dashboard"),
+    path("api/user_profile/", views.user_profile, name="user_profile"),
     path("api/user_work_experiences/", views.user_work_experiences, name="user_work_experiences"),
     path("api/user_skills/", views.user_skills),
     path("api/user_preferences/", views.user_preferences, name="user_preferences"),

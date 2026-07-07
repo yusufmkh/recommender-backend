@@ -44,6 +44,22 @@ def user_dashboard(request, format=None):
     }
   )
 
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def user_profile(request, format=None):
+  user = MyUser.objects.get(pk=request.user.id)
+
+  if request.method == 'GET':
+    serializer = MyUserSerializer(user)
+    return Response(serializer.data)
+
+  elif request.method == 'PATCH':
+    serializer = MyUserSerializer(user, data=request.data, partial=True)
+    if serializer.is_valid():
+      serializer.save()
+      return Response(serializer.data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def user_work_experiences(request):
