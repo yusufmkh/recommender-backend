@@ -109,6 +109,22 @@ class Company(models.Model):
 def get_company_name():
   return Company.objects.get('name')
 
+class CompanyBranch(models.Model):
+  company = models.ForeignKey(Company, related_name='branches', on_delete=models.CASCADE)
+  name = models.CharField(max_length=100)
+  email = models.EmailField(max_length=254, blank=True)
+  phone_number = models.CharField(max_length=30, blank=True)
+  address = models.CharField(max_length=300)
+  postcode = models.CharField(max_length=20)
+  city = models.CharField(max_length=100)
+  state = models.CharField(max_length=100)
+  country = models.CharField(max_length=100)
+  created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
+
+  def __str__(self):
+    return f"{self.company.name} - {self.name}"
+
 class Skill(models.Model):
   name = models.CharField(max_length=100, unique=True)
   created_at = models.DateTimeField(auto_now_add=True)
@@ -119,6 +135,7 @@ class Skill(models.Model):
 
 class Job(models.Model):
   company = models.ForeignKey(Company, related_name='jobs', on_delete=models.CASCADE, null=True)
+  branch = models.ForeignKey(CompanyBranch, related_name='jobs', on_delete=models.SET_NULL, null=True, blank=True)
   skills = models.ManyToManyField(Skill, related_name='jobs')
   title = models.CharField(max_length=100)
   description = models.TextField()

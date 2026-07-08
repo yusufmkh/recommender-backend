@@ -1,12 +1,19 @@
 from rest_framework import serializers
-from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
     model = MyUser
     fields = ['id', 'first_name', 'last_name', 'email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
 
+class CompanyBranchSerializer(serializers.ModelSerializer):
+  class Meta:
+    model = CompanyBranch
+    fields = '__all__'
+
 class CompanySerializer(serializers.ModelSerializer):
+  branches = CompanyBranchSerializer(many=True, read_only=True)
+
   class Meta:
     model = Company
     fields = '__all__'
