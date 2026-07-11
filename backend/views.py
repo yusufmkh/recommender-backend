@@ -1,3 +1,5 @@
+from django.conf import settings
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -6,6 +8,15 @@ from rest_framework import status
 from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
 from .serializers import MyUserSerializer, CompanySerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
+
+from .s3_utils import generate_presigned_post, delete_object
+
+def _delete_old_photo_if_replaced(old_photo, new_photo):
+  if old_photo and old_photo != new_photo:
+    try:
+      delete_object(old_photo)
+    except Exception:
+      pass
 
 @api_view(['POST'])
 def user_register(request):
@@ -54,9 +65,11 @@ def user_profile(request, format=None):
     return Response(serializer.data)
 
   elif request.method == 'PATCH':
+    old_photo = user.photo
     serializer = MyUserSerializer(user, data=request.data, partial=True)
     if serializer.is_valid():
       serializer.save()
+      _delete_old_photo_if_replaced(old_photo, serializer.data.get('photo'))
       return Response(serializer.data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -142,6 +155,48 @@ def company_register(request):
     return Response(company_data_serializer.data, status=status.HTTP_201_CREATED)
   else:
     return Response(company_data_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def company_profile(request, format=None):
+  company = Company.objects.get(user=request.user)
+
+  if request.method == 'GET':
+    serializer = CompanySerializer(company)
+    return Response(serializer.data)
+
+  elif request.method == 'PATCH':
+    old_photo = company.photo
+    serializer = CompanySerializer(company, data=request.data, partial=True)
+    if serializer.is_valid():
+      serializer.save()
+      _delete_old_photo_if_replaced(old_photo, serializer.data.get('photo'))
+      return Response(serializer.data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def photo_presign(request, format=None):
+  filename = request.data.get('filename')
+  content_type = request.data.get('content_type')
+
+  if not filename or not content_type:
+    return Response(
+      {'error': 'filename and content_type are required.'},
+      status=status.HTTP_400_BAD_REQUEST,
+    )
+
+  if content_type not in settings.AWS_S3_ALLOWED_CONTENT_TYPES:
+    return Response({'error': 'Unsupported file type.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  try:
+    presign_data = generate_presigned_post(
+      user_id=request.user.id, filename=filename, content_type=content_type,
+    )
+  except Exception:
+    return Response({'error': 'Could not generate upload URL.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+  return Response(presign_data, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

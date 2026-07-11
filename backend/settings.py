@@ -27,6 +27,15 @@ environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = env('SECRET_KEY')
 
+# AWS S3 (company photo uploads)
+AWS_ACCESS_KEY_ID = env('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = env('AWS_SECRET_ACCESS_KEY')
+AWS_S3_REGION_NAME = env('AWS_S3_REGION_NAME')
+AWS_STORAGE_BUCKET_NAME = env('AWS_STORAGE_BUCKET_NAME')
+AWS_S3_UPLOADS_ROOT = env('AWS_S3_UPLOADS_ROOT', default='uploads')
+AWS_S3_MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024
+AWS_S3_ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
