@@ -112,6 +112,7 @@ def get_company_name():
 class CompanyBranch(models.Model):
   company = models.ForeignKey(Company, related_name='branches', on_delete=models.CASCADE)
   name = models.CharField(max_length=100)
+  photo = models.CharField(max_length=500, blank=True)
   email = models.EmailField(max_length=254, blank=True)
   phone_number = models.CharField(max_length=30, blank=True)
   address = models.CharField(max_length=300)

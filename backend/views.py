@@ -5,9 +5,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import MyUser, Company, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
-from .serializers import MyUserSerializer, CompanySerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
+from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
 
@@ -173,6 +173,54 @@ def company_profile(request, format=None):
       _delete_old_photo_if_replaced(old_photo, serializer.data.get('photo'))
       return Response(serializer.data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def company_branches(request, format=None):
+  company = Company.objects.get(user=request.user)
+
+  if request.method == 'GET':
+    branches = CompanyBranch.objects.filter(company=company)
+    serializer = CompanyBranchSerializer(branches, many=True)
+    return Response(serializer.data)
+
+  elif request.method == 'POST':
+    branch_data = request.data.dict() if hasattr(request.data, 'dict') else request.data
+    serializer = CompanyBranchSerializer(data={'company': company.id, **branch_data})
+    if serializer.is_valid():
+      serializer.save()
+      return Response(serializer.data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def company_branch_details(request, id, format=None):
+  try:
+    branch = CompanyBranch.objects.get(pk=id, company__user=request.user)
+  except CompanyBranch.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  if request.method == 'GET':
+    serializer = CompanyBranchSerializer(branch)
+    return Response(serializer.data)
+
+  elif request.method == 'PATCH':
+    old_photo = branch.photo
+    serializer = CompanyBranchSerializer(branch, data=request.data, partial=True)
+    if serializer.is_valid():
+      serializer.save()
+      _delete_old_photo_if_replaced(old_photo, serializer.data.get('photo'))
+      return Response(serializer.data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+  elif request.method == 'DELETE':
+    if branch.photo:
+      try:
+        delete_object(branch.photo)
+      except Exception:
+        pass
+    branch.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
