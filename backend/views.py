@@ -159,7 +159,10 @@ def company_register(request):
 @api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def company_profile(request, format=None):
-  company = Company.objects.get(user=request.user)
+  try:
+    company = Company.objects.get(user=request.user)
+  except Company.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
 
   if request.method == 'GET':
     serializer = CompanySerializer(company)
