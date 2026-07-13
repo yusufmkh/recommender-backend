@@ -1,8 +1,13 @@
 from django.conf import settings
+from django.db import IntegrityError, transaction
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.encoding import force_str
+from django.utils.http import urlsafe_base64_decode
 
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework import status
 
 from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
@@ -10,6 +15,8 @@ from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, 
 from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
+from .tokens import email_verification_token
+from .emails import send_verification_email, send_password_reset_email
 
 def _delete_old_photo_if_replaced(old_photo, new_photo):
   if old_photo and old_photo != new_photo:
@@ -18,14 +25,125 @@ def _delete_old_photo_if_replaced(old_photo, new_photo):
     except Exception:
       pass
 
+def _user_from_uid(uid):
+  try:
+    return MyUser.objects.get(pk=force_str(urlsafe_base64_decode(uid)))
+  except (MyUser.DoesNotExist, ValueError, TypeError, OverflowError):
+    return None
+
 @api_view(['POST'])
 def user_register(request):
-  user = MyUser.objects.create_user(**request.data)
+  # is_active is never trusted from the client: every new account starts
+  # inactive until the verification link is used, regardless of what the
+  # request body contains.
+  user_fields = {k: v for k, v in request.data.items() if k != 'is_active'}
+
+  try:
+    user = MyUser.objects.create_user(**user_fields)
+  except IntegrityError:
+    return Response({'error': 'An account with this email or username already exists.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  send_verification_email(user)
+
   user_data_serializer = MyUserSerializer(user)
-  # if user_data_serializer.is_valid():
-    # user_data_serializer.save()
-    
   return Response(user_data_serializer.data, status=status.HTTP_201_CREATED)
+
+@api_view(['POST'])
+@transaction.atomic
+def employer_register(request):
+  # Creates the user and their company together, atomically, without
+  # requiring the caller to already be authenticated - the account is
+  # inactive until email verification, so no JWT can be issued yet.
+  company_fields = ('company_name', 'legal_name', 'company_email', 'company_size', 'phone_number', 'website', 'address', 'postcode', 'city', 'state', 'country')
+  user_fields = {k: v for k, v in request.data.items() if k not in company_fields and k != 'is_active'}
+
+  try:
+    user = MyUser.objects.create_user(**user_fields)
+  except IntegrityError:
+    return Response({'error': 'An account with this email or username already exists.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  company_data_serializer = CompanySerializer(data={
+    'user': user.id,
+    'name': request.data.get('company_name'),
+    'legal_name': request.data.get('legal_name') or '',
+    'email': request.data.get('company_email'),
+    'company_size': request.data.get('company_size'),
+    'phone_number': request.data.get('phone_number'),
+    'website': request.data.get('website') or '',
+    'address': request.data.get('address'),
+    'postcode': request.data.get('postcode'),
+    'city': request.data.get('city'),
+    'state': request.data.get('state'),
+    'country': request.data.get('country'),
+  })
+
+  if not company_data_serializer.is_valid():
+    transaction.set_rollback(True)
+    return Response(company_data_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+  company_data_serializer.save()
+  send_verification_email(user)
+
+  return Response(MyUserSerializer(user).data, status=status.HTTP_201_CREATED)
+
+@api_view(['POST'])
+@throttle_classes([ScopedRateThrottle])
+def password_reset_request(request):
+  email = (request.data.get('email') or '').strip()
+
+  user = MyUser.objects.filter(email__iexact=email).first()
+  if user:
+    send_password_reset_email(user)
+
+  # Always return the same response, whether or not the email exists,
+  # so this endpoint can't be used to enumerate registered accounts.
+  return Response({'ok': True})
+
+password_reset_request.cls.throttle_scope = 'password_reset'
+
+@api_view(['POST'])
+def password_reset_confirm(request):
+  user = _user_from_uid(request.data.get('uid'))
+  token = request.data.get('token')
+  new_password = request.data.get('password')
+
+  if not user or not token or not default_token_generator.check_token(user, token):
+    return Response({'error': 'This reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  if not new_password or len(new_password) < 8:
+    return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  user.set_password(new_password)
+  user.save()
+
+  return Response({'ok': True})
+
+@api_view(['POST'])
+def email_verify_confirm(request):
+  user = _user_from_uid(request.data.get('uid'))
+  token = request.data.get('token')
+
+  if not user or not token or not email_verification_token.check_token(user, token):
+    return Response({'error': 'This verification link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  if not user.is_active:
+    user.is_active = True
+    user.save()
+
+  return Response({'ok': True})
+
+@api_view(['POST'])
+@throttle_classes([ScopedRateThrottle])
+def email_verify_resend(request):
+  email = (request.data.get('email') or '').strip()
+
+  user = MyUser.objects.filter(email__iexact=email, is_active=False).first()
+  if user:
+    send_verification_email(user)
+
+  return Response({'ok': True})
+
+email_verify_resend.cls.throttle_scope = 'email_verify'
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])

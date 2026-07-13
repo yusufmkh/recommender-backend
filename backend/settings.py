@@ -36,6 +36,18 @@ AWS_S3_UPLOADS_ROOT = env('AWS_S3_UPLOADS_ROOT', default='uploads')
 AWS_S3_MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024
 AWS_S3_ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
 
+# Email (password reset / email verification)
+# Defaults to printing emails to the console so local dev needs no extra setup.
+# Set EMAIL_BACKEND=django_ses.SESBackend in .env to send real emails via SES,
+# reusing the AWS credentials above.
+EMAIL_BACKEND = env('EMAIL_BACKEND', default='django.core.mail.backends.console.EmailBackend')
+AWS_SES_REGION_NAME = env('AWS_SES_REGION_NAME', default=AWS_S3_REGION_NAME)
+AWS_SES_REGION_ENDPOINT = f'email.{AWS_SES_REGION_NAME}.amazonaws.com'
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='Recommender <noreply@recapp.example>')
+
+# Base URL of the Next.js frontend, used to build links inside emails.
+FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
@@ -53,13 +65,17 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "backend",
     "rest_framework",
-    "rest_framework_simplejwt.token_blacklist"
+    "rest_framework_simplejwt.token_blacklist",
 ]
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-    )
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'password_reset': '5/hour',
+        'email_verify': '5/hour',
+    },
 }
 
 from datetime import timedelta

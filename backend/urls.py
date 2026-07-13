@@ -19,17 +19,22 @@ from django.urls import path
 from rest_framework.urlpatterns import format_suffix_patterns
 
 from backend import views
+from backend.token_views import EmailAwareTokenObtainPairView
 
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
     TokenRefreshView,
 )
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('api/token/', EmailAwareTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path("api/user_register/", views.user_register, name="user_register"),
+    path("api/employer_register/", views.employer_register, name="employer_register"),
+    path("api/password_reset/request/", views.password_reset_request, name="password_reset_request"),
+    path("api/password_reset/confirm/", views.password_reset_confirm, name="password_reset_confirm"),
+    path("api/email_verify/confirm/", views.email_verify_confirm, name="email_verify_confirm"),
+    path("api/email_verify/resend/", views.email_verify_resend, name="email_verify_resend"),
     path("api/user_dashboard/", views.user_dashboard, name="user_dashboard"),
     path("api/user_profile/", views.user_profile, name="user_profile"),
     path("api/user_work_experiences/", views.user_work_experiences, name="user_work_experiences"),
