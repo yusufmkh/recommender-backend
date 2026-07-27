@@ -12,7 +12,7 @@ from rest_framework import status
 
 from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
-from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
+from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, CandidateMatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
@@ -422,14 +422,14 @@ def company_dashboard(request, format=None):
   company_info = Company.objects.get(user=request.user)
   company_jobs = Job.objects.filter(company=company_info)
   job_applicants = Application.objects.filter(job__in=company_jobs)
-  candidate_matches = Match.objects.filter(job__in=company_jobs)
+  candidate_matches = Match.objects.filter(job__in=company_jobs).prefetch_related('user__work_experiences')
   candidate_invites = Match.objects.filter(job__in=company_jobs, is_invited__exact=True)
   saved_candidates = SavedCandidate.objects.filter(company=company_info)
 
   company_info_serializer = CompanySerializer(company_info)
   company_jobs_serializer = JobSerializer(company_jobs, many=True)
   job_applicants_serializer = ApplicationSerializer(job_applicants, many=True)
-  candidate_matches_serializer = MatchSerializer(candidate_matches, many=True)
+  candidate_matches_serializer = CandidateMatchSerializer(candidate_matches, many=True)
   candidate_invites_serializer = MatchSerializer(candidate_invites, many=True)
   saved_candidates_serializer = SavedCandidateSerializer(saved_candidates, many=True)
 
@@ -443,6 +443,46 @@ def company_dashboard(request, format=None):
       'saved_candidates': saved_candidates_serializer.data
     }
   )
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def match_invite(request, id, format=None):
+  try:
+    match = Match.objects.get(pk=id)
+  except Match.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  # Only the company that owns the matched job may invite the candidate.
+  if match.job.company is None or match.job.company.user_id != request.user.id:
+    return Response(status=status.HTTP_403_FORBIDDEN)
+
+  match.is_invited = True
+  match.save()
+
+  return Response(MatchSerializer(match).data)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def candidate_profile(request, user_id, format=None):
+  # An employer may view a candidate only if that candidate is matched to one of the
+  # employer's own jobs.
+  is_match = Match.objects.filter(user_id=user_id, job__company__user=request.user).exists()
+  if not is_match:
+    return Response(status=status.HTTP_403_FORBIDDEN)
+
+  try:
+    candidate = MyUser.objects.get(pk=user_id)
+  except MyUser.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  work_experiences = WorkExperience.objects.filter(user=candidate).order_by('-start_date')
+  preference = Preference.objects.filter(user=candidate).first()
+
+  return Response({
+    'work_experiences': WorkExperienceSerializer(work_experiences, many=True).data,
+    'preferences': PreferenceSerializer(preference).data if preference else None,
+    'contact': {'email': candidate.email, 'phone_number': candidate.phone_number},
+  })
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])

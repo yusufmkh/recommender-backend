@@ -216,6 +216,8 @@ class Match(models.Model):
   user = models.ForeignKey(get_user_model(), related_name='matches', on_delete=models.CASCADE)
   job = models.ForeignKey(Job, related_name='matches', on_delete=models.CASCADE)
   is_invited = models.BooleanField(default=False)
+  # Recommender match score (0-100). Null until a score is generated.
+  score = models.FloatField(null=True, blank=True)
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
 

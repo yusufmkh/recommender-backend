@@ -59,6 +59,33 @@ class MatchSerializer(serializers.ModelSerializer):
     model = Match
     fields = '__all__'
 
+# Lean, safe subset of MyUser for showing a matched candidate to an employer
+# (no email / permission flags).
+class CandidateMatchUserSerializer(serializers.ModelSerializer):
+  class Meta:
+    model = MyUser
+    fields = ['id', 'first_name', 'last_name', 'user_name', 'photo', 'address', 'city']
+
+# Match enriched with the candidate's profile + their current role (derived from
+# work experience) for the employer's matched-candidates page.
+class CandidateMatchSerializer(serializers.ModelSerializer):
+  user = CandidateMatchUserSerializer(read_only=True)
+  current_role = serializers.SerializerMethodField()
+
+  class Meta:
+    model = Match
+    fields = ['id', 'user', 'job', 'is_invited', 'score', 'created_at', 'current_role']
+
+  def get_current_role(self, obj):
+    # Prefer an ongoing role (no end date), else the most recent one.
+    experiences = obj.user.work_experiences.all()
+    ongoing = [we for we in experiences if we.end_date is None]
+    pool = ongoing or list(experiences)
+    if not pool:
+      return None
+    latest = max(pool, key=lambda we: we.start_date)
+    return latest.job_title
+
 class ApplicationSerializer(serializers.ModelSerializer):
   class Meta:
     model = Application
