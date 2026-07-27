@@ -32,15 +32,23 @@ def _user_from_uid(uid):
     return None
 
 def _get_or_create_skills(skill_names):
-  # Skills are sent as a list of names; reuse any that already exist and
-  # create the rest, returning the resolved Skill instances.
+  # Skills are sent as a list of names; names are normalized (trimmed and
+  # matched case-insensitively) so "Python", "python" and " python " all
+  # resolve to a single Skill row, and the rest are created. Duplicates
+  # within one request are collapsed. New skills are stored in sentence case:
+  # first letter uppercase, the rest lowercased ("SQL" -> "Sql").
   skills = []
-  for name in skill_names:
-    try:
-      skill = Skill.objects.get(name=name)
-    except Skill.DoesNotExist:
-      skill = Skill(name=name)
-      skill.save()
+  seen = set()
+  for raw in skill_names:
+    name = (raw or '').strip()
+    if not name:
+      continue
+    key = name.casefold()
+    if key in seen:
+      continue
+    seen.add(key)
+    name = name[:1].upper() + name[1:].lower()
+    skill, _ = Skill.objects.get_or_create(name__iexact=name, defaults={'name': name})
     skills.append(skill)
   return skills
 
@@ -215,24 +223,52 @@ def user_work_experiences(request):
     return Response(work_experiences_serializer.data)
   
   elif request.method == 'POST':
-      work_skills_data = request.data.pop('skills')
-      work_experience = WorkExperience.objects.create(user=request.user, **request.data)
+      we_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
+      we_skills = we_data.pop('skills', [])
 
-      for work_skill_data in work_skills_data:
-        try:
-          skill = Skill.objects.get(name=work_skill_data)
-        except Skill.DoesNotExist:
-          skill = Skill(name=work_skill_data)
-          skill.save()
-        work_experience.skills.add(skill)
-      
+      work_experience = WorkExperience.objects.create(user=request.user, **we_data)
+      work_experience.skills.set(_get_or_create_skills(we_skills))
+
       work_experience_serializer = WorkExperienceSerializer(work_experience)
 
       return Response(work_experience_serializer.data, status=status.HTTP_201_CREATED)
 
+@api_view(['GET', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def user_work_experience_details(request, id, format=None):
+  # Scoped to the requesting user so a candidate can only read or edit
+  # their own work experience, mirroring how job_details scopes to owner.
+  try:
+    work_experience = WorkExperience.objects.get(pk=id, user=request.user)
+  except WorkExperience.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  if request.method == 'GET':
+    return Response(WorkExperienceSerializer(work_experience).data)
+
+  if request.method == 'PATCH':
+    we_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
+    we_skills = we_data.pop('skills', None)
+
+    editable_fields = ('job_title', 'description', 'company_name', 'company_address', 'company_website', 'start_date', 'end_date')
+    for field in editable_fields:
+      if field in we_data:
+        setattr(work_experience, field, we_data[field])
+    work_experience.save()
+
+    # None means "skills not supplied, leave them"; a list (even []) replaces the set.
+    if we_skills is not None:
+      work_experience.skills.set(_get_or_create_skills(we_skills))
+
+    return Response(WorkExperienceSerializer(work_experience).data)
+
+  elif request.method == 'DELETE':
+    work_experience.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
-def user_skills(request):
+def skills(request):
   if request.method == 'GET':
     skills = Skill.objects.all()
     skills_serializer = SkillSerializer(skills, many=True)

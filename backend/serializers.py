@@ -24,7 +24,7 @@ class SkillSerializer(serializers.ModelSerializer):
     fields = '__all__'
 
 class JobSerializer(serializers.ModelSerializer):
-  skills = SkillSerializer(many=True)
+  skills = SkillSerializer(many=True, read_only=True)
 
   class Meta:
     model = Job
@@ -32,7 +32,7 @@ class JobSerializer(serializers.ModelSerializer):
     depth = 1
 
 class WorkExperienceSerializer(serializers.ModelSerializer):
-  skills = SkillSerializer(many=True)
+  skills = SkillSerializer(many=True, read_only=True)
 
   class Meta:
     model = WorkExperience

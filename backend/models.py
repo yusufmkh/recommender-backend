@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models.functions import Lower
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 
@@ -130,6 +131,13 @@ class Skill(models.Model):
   name = models.CharField(max_length=100, unique=True)
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    constraints = [
+      # Case-insensitive uniqueness so "Python", "python" and "PYTHON"
+      # can never become separate rows that break skill matching.
+      models.UniqueConstraint(Lower('name'), name='unique_skill_name_ci'),
+    ]
 
   def __str__(self):
     return self.name
