@@ -31,6 +31,19 @@ def _user_from_uid(uid):
   except (MyUser.DoesNotExist, ValueError, TypeError, OverflowError):
     return None
 
+def _get_or_create_skills(skill_names):
+  # Skills are sent as a list of names; reuse any that already exist and
+  # create the rest, returning the resolved Skill instances.
+  skills = []
+  for name in skill_names:
+    try:
+      skill = Skill.objects.get(name=name)
+    except Skill.DoesNotExist:
+      skill = Skill(name=name)
+      skill.save()
+    skills.append(skill)
+  return skills
+
 @api_view(['POST'])
 def user_register(request):
   # is_active is never trusted from the client: every new account starts
@@ -398,31 +411,24 @@ def company_dashboard(request, format=None):
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def jobs(request, format=None):
-
-  jobs = Job.objects.all()
-  jobs_data = JobSerializer(jobs, many=True).data
-
   if request.method == 'GET':
+    jobs = Job.objects.all()
     jobs_serializer = JobSerializer(jobs, many=True)
     return Response(jobs_serializer.data)
-  
+
   if request.method == 'POST':
-    job_data = request.data
-    job_skills = job_data.pop('skills')
-    job = Job.objects.create(**job_data)
+    company = Company.objects.get(user=request.user)
 
-    company = Company.objects.get(user_id=request.user)
-    company_data = CompanySerializer(company).data
+    job_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
+    job_skills = job_data.pop('skills', [])
 
-    for job_skill in job_skills:
-      try:
-        skill = Skill.objects.get(name=job_skill)
-      except Skill.DoesNotExist:
-        skill = Skill(name=job_skill)
-        skill.save()
-        
-      job.skills.add(skill)
-    
+    branch_id = job_data.pop('branch', None) or None
+    if branch_id is not None and not CompanyBranch.objects.filter(pk=branch_id, company=company).exists():
+      return Response({'error': 'Branch does not belong to your company.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    job = Job.objects.create(company=company, branch_id=branch_id, **job_data)
+    job.skills.set(_get_or_create_skills(job_skills))
+
     job_serializer = JobSerializer(job)
 
     return Response({
@@ -430,7 +436,7 @@ def jobs(request, format=None):
       "candidate_predictions": 'Candidate predictions here',
       }, status=status.HTTP_201_CREATED)
 
-@api_view(['GET', 'PUT', 'DELETE'])
+@api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def job_details(request, id, format=None):
   try:
@@ -441,28 +447,33 @@ def job_details(request, id, format=None):
   if request.method == 'GET':
     job_serializer = JobSerializer(job)
     return Response(job_serializer.data)
-  
-  elif request.method == 'PUT':
 
-    job_skills = request.data.pop('skills')
-    updated_job = Job.objects.create(**request.data)
+  # Editing or deleting a job is only allowed for the company that owns it.
+  if job.company is None or job.company.user_id != request.user.id:
+    return Response(status=status.HTTP_403_FORBIDDEN)
 
-    for job_skill in job_skills:
-      try:
-        skill = Skill.objects.get(name=job_skill)
-      except Skill.DoesNotExist:
-        skill = Skill(name=job_skill)
-        skill.save()
-        
-      updated_job.skills.add(skill)
+  if request.method == 'PATCH':
+    job_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
+    job_skills = job_data.pop('skills', None)
 
-    job_serializer = JobSerializer(job, data=updated_job)
-    if job_serializer.is_valid():
-      job_serializer.save()
-      return Response(job_serializer.data)
-    
-    else:
-      return Response(job_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    if 'branch' in job_data:
+      branch_id = job_data.pop('branch') or None
+      if branch_id is not None and not CompanyBranch.objects.filter(pk=branch_id, company=job.company).exists():
+        return Response({'error': 'Branch does not belong to your company.'}, status=status.HTTP_400_BAD_REQUEST)
+      job.branch_id = branch_id
+
+    editable_fields = ('title', 'description', 'job_type', 'pay', 'pay_range', 'status', 'contact')
+    for field in editable_fields:
+      if field in job_data:
+        setattr(job, field, job_data[field])
+    job.save()
+
+    if job_skills is not None:
+      job.skills.set(_get_or_create_skills(job_skills))
+
+    job_serializer = JobSerializer(job)
+    return Response(job_serializer.data)
+
   elif request.method == 'DELETE':
     job.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
