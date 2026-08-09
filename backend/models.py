@@ -208,9 +208,24 @@ class SavedJob(models.Model):
   job = models.ForeignKey(Job, related_name='saved_jobs', on_delete=models.CASCADE)
 
 class SavedCandidate(models.Model):
+  # A company's shortlist. One row per candidate - saving is per-company; 
+  # the roles they matched or were invited to come from Match
   company = models.ForeignKey(Company, related_name='saved_candidates', on_delete=models.CASCADE)
-  job = models.ForeignKey(Job, related_name='saved_candidates', on_delete=models.CASCADE, blank=True, null=True)
   user = models.ForeignKey(get_user_model(), related_name='saved_candidates', on_delete=models.CASCADE)
+  note = models.TextField(blank=True, default='')
+  created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    ordering = ['-created_at']
+    constraints = [
+      # Makes saving idempotent: get_or_create can race safely because the
+      # database rejects the second insert and Django falls back to the get.
+      models.UniqueConstraint(fields=['company', 'user'], name='unique_saved_candidate_per_company'),
+    ]
+
+  def __str__(self):
+    return f"{self.company.name} - {self.user.user_name}"
 
 class Match(models.Model):
   user = models.ForeignKey(get_user_model(), related_name='matches', on_delete=models.CASCADE)

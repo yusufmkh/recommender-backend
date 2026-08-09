@@ -52,7 +52,8 @@ urlpatterns = [
     path("api/matches/<int:id>/invite", views.match_invite, name="match_invite"),
     path("api/candidates/<int:user_id>", views.candidate_profile, name="candidate_profile"),
     path("api/saved_jobs/", views.saved_jobs, name="saved_jobs"),
-    path("api/saved_candidates/company/<int:company_id>", views.saved_candidates, name="saved_candidates"),
+    path("api/company/saved_candidates/", views.company_saved_candidates, name="company_saved_candidates"),
+    path("api/company/saved_candidates/<int:id>/", views.company_saved_candidate_details, name="company_saved_candidate_details"),
     path("api/applications/", views.job_applications, name="applications"),
 ]
 

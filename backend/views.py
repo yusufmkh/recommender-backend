@@ -12,7 +12,7 @@ from rest_framework import status
 
 from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
-from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, MatchSerializer, CandidateMatchSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
+from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
@@ -30,6 +30,39 @@ def _user_from_uid(uid):
     return MyUser.objects.get(pk=force_str(urlsafe_base64_decode(uid)))
   except (MyUser.DoesNotExist, ValueError, TypeError, OverflowError):
     return None
+
+def _company_candidates(company):
+  # Every candidate this company can see, one row each: their matches on the
+  # company's jobs plus shortlist metadata. Four queries - matches, saved, users,
+  # work experiences - flat regardless of how many candidates there are.
+  company_jobs = Job.objects.filter(company=company)
+  matches = Match.objects.filter(job__in=company_jobs)
+  saved = SavedCandidate.objects.filter(company=company)
+
+  # Union the ids first so an overlapping candidate is fetched once, and their
+  # work experiences prefetched once, rather than once per queryset. Neither
+  # queryset needs select_related('user') as a result.
+  user_ids = {m.user_id for m in matches} | {s.user_id for s in saved}
+  users_by_id = {u.id: u for u in MyUser.objects.filter(pk__in=user_ids).prefetch_related('work_experiences')}
+
+  rows = {uid: {'user': users_by_id[uid], 'matches': [], 'saved': None} for uid in user_ids}
+  for match in matches:
+    rows[match.user_id]['matches'].append(match)
+  for saved_candidate in saved:
+    # A shortlisted candidate stays listed even once their matches are gone.
+    rows[saved_candidate.user_id]['saved'] = saved_candidate
+
+  return company_jobs, matches, rows
+
+def _company_can_view_candidate(employer, candidate_id):
+  # An employer may see a candidate matched to, applied to, or shortlisted by
+  # their company - and nobody else. Without this, saving would be an oracle for
+  # enumerating user ids.
+  return (
+    Match.objects.filter(user_id=candidate_id, job__company__user=employer).exists()
+    or Application.objects.filter(user_id=candidate_id, job__company__user=employer).exists()
+    or SavedCandidate.objects.filter(user_id=candidate_id, company__user=employer).exists()
+  )
 
 def _get_or_create_skills(skill_names):
   # Skills are sent as a list of names; names are normalized (trimmed and
@@ -420,27 +453,35 @@ def photo_presign(request, format=None):
 @permission_classes([IsAuthenticated])
 def company_dashboard(request, format=None):
   company_info = Company.objects.get(user=request.user)
-  company_jobs = Job.objects.filter(company=company_info)
+  company_jobs, all_matches, rows = _company_candidates(company_info)
   job_applicants = Application.objects.filter(job__in=company_jobs)
-  candidate_matches = Match.objects.filter(job__in=company_jobs).prefetch_related('user__work_experiences')
-  candidate_invites = Match.objects.filter(job__in=company_jobs, is_invited__exact=True)
-  saved_candidates = SavedCandidate.objects.filter(company=company_info)
+
+  # Saving a candidate moves them off the matched list and onto the shortlist.
+  # Both keys carry the same shape, so the two pages share one serializer.
+  unsaved = [row for row in rows.values() if row['saved'] is None]
+  shortlisted = [row for row in rows.values() if row['saved'] is not None]
+
+  # Explicit ordering: dict insertion order follows the database's, which is
+  # arbitrary. Best match first for triage, most recently saved first for the
+  # shortlist.
+  unsaved.sort(key=lambda row: max((m.score or 0) for m in row['matches']) if row['matches'] else -1, reverse=True)
+  shortlisted.sort(key=lambda row: row['saved'].created_at, reverse=True)
 
   company_info_serializer = CompanySerializer(company_info)
-  company_jobs_serializer = JobSerializer(company_jobs, many=True)
+  company_jobs_serializer = JobSerializer(company_jobs.select_related('branch', 'company').prefetch_related('skills'), many=True)
   job_applicants_serializer = ApplicationSerializer(job_applicants, many=True)
-  candidate_matches_serializer = CandidateMatchSerializer(candidate_matches, many=True)
-  candidate_invites_serializer = MatchSerializer(candidate_invites, many=True)
-  saved_candidates_serializer = SavedCandidateSerializer(saved_candidates, many=True)
 
   return Response(
     {
       'company_info': company_info_serializer.data,
       'company_jobs': company_jobs_serializer.data,
       'job_applicants': job_applicants_serializer.data,
-      'candidate_matches': candidate_matches_serializer.data,
-      'candidate_invites': candidate_invites_serializer.data,
-      'saved_candidates': saved_candidates_serializer.data
+      'candidate_matches': CompanyCandidateSerializer(unsaved, many=True).data,
+      'saved_candidates': CompanyCandidateSerializer(shortlisted, many=True).data,
+      # Filtered from the rows already in memory - no second query, and always
+      # consistent with candidate_matches. Invites are deliberately NOT filtered
+      # by shortlist status: the two axes are independent.
+      'candidate_invites': MatchSerializer([m for m in all_matches if m.is_invited], many=True).data,
     }
   )
 
@@ -464,10 +505,7 @@ def match_invite(request, id, format=None):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def candidate_profile(request, user_id, format=None):
-  # An employer may view a candidate only if that candidate is matched to one of the
-  # employer's own jobs.
-  is_match = Match.objects.filter(user_id=user_id, job__company__user=request.user).exists()
-  if not is_match:
+  if not _company_can_view_candidate(request.user, user_id):
     return Response(status=status.HTTP_403_FORBIDDEN)
 
   try:
@@ -572,24 +610,59 @@ def saved_jobs(request):
     else:
       return Response(saved_job_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-@api_view(['GET', 'POST'])
+@api_view(['POST'])
 @permission_classes([IsAuthenticated])
-def saved_candidates(request, company_id):
-  if request.method == 'GET':
-    # Validate if the user has the company with the "company_id"
-    saved_candidates = SavedCandidate.objects.filter(company=company_id)
-    saved_candidates_serializer = SavedCandidateSerializer(saved_candidates, many=True)
+def company_saved_candidates(request):
+  # The company is always derived from the token - never taken from the client -
+  # so one employer can't read or write another's shortlist.
+  try:
+    company = Company.objects.get(user=request.user)
+  except Company.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
 
-    return Response(saved_candidates_serializer.data)
-  
-  elif request.method == 'POST':
-    saved_candidate_serializer = SavedCandidateSerializer(data={'company': company_id, **request.data})
-    if saved_candidate_serializer.is_valid():
-      saved_candidate_serializer.save()
+  candidate_id = request.data.get('user')
+  if not candidate_id:
+    return Response({'error': 'user is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-      return Response(saved_candidate_serializer.data, status=status.HTTP_201_CREATED)
-    else:
-      return Response(saved_candidate_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+  if not _company_can_view_candidate(request.user, candidate_id):
+    return Response(status=status.HTTP_403_FORBIDDEN)
+
+  note = request.data.get('note') or ''
+  if len(note) > 2000:
+    return Response({'error': 'Note is too long.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  # Idempotent: saving twice returns the existing row rather than erroring, and the
+  # unique constraint makes the race safe.
+  saved_candidate, created = SavedCandidate.objects.get_or_create(
+    company=company, user_id=candidate_id, defaults={'note': note},
+  )
+
+  serializer = SavedMetaSerializer(saved_candidate)
+  return Response(serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def company_saved_candidate_details(request, id, format=None):
+  # Scoped to the requesting employer's own company, so another company's row is
+  # indistinguishable from one that doesn't exist.
+  try:
+    saved_candidate = SavedCandidate.objects.get(pk=id, company__user=request.user)
+  except SavedCandidate.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  if request.method == 'PATCH':
+    if 'note' in request.data:
+      note = request.data.get('note') or ''
+      if len(note) > 2000:
+        return Response({'error': 'Note is too long.'}, status=status.HTTP_400_BAD_REQUEST)
+      saved_candidate.note = note
+      saved_candidate.save(update_fields=['note', 'updated_at'])
+
+    return Response(SavedMetaSerializer(saved_candidate).data)
+
+  elif request.method == 'DELETE':
+    saved_candidate.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
