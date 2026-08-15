@@ -18,6 +18,15 @@ from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
 from .emails import send_verification_email, send_password_reset_email
 
+# The only user fields registration accepts from a client. create_user passes
+# **kwargs straight onto the model, so an unfiltered body could set is_staff /
+# is_superuser (privilege escalation) or is_active (skipping email verification),
+# and any unknown key would be a TypeError -> 500.
+USER_SELF_FIELDS = {
+  'first_name', 'last_name', 'email', 'user_name', 'password', 'photo',
+  'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country',
+}
+
 def _delete_old_photo_if_replaced(old_photo, new_photo):
   if old_photo and old_photo != new_photo:
     try:
@@ -87,10 +96,10 @@ def _get_or_create_skills(skill_names):
 
 @api_view(['POST'])
 def user_register(request):
-  # is_active is never trusted from the client: every new account starts
-  # inactive until the verification link is used, regardless of what the
-  # request body contains.
-  user_fields = {k: v for k, v in request.data.items() if k != 'is_active'}
+  # Whitelist, don't blacklist: privilege flags are never trusted from the
+  # client, and every new account starts inactive until the verification link
+  # is used, regardless of what the request body contains.
+  user_fields = {k: v for k, v in request.data.items() if k in USER_SELF_FIELDS}
 
   try:
     user = MyUser.objects.create_user(**user_fields)
@@ -109,7 +118,7 @@ def employer_register(request):
   # requiring the caller to already be authenticated - the account is
   # inactive until email verification, so no JWT can be issued yet.
   company_fields = ('company_name', 'legal_name', 'company_email', 'company_size', 'phone_number', 'website', 'address', 'postcode', 'city', 'state', 'country')
-  user_fields = {k: v for k, v in request.data.items() if k not in company_fields and k != 'is_active'}
+  user_fields = {k: v for k, v in request.data.items() if k in USER_SELF_FIELDS and k not in company_fields}
 
   try:
     user = MyUser.objects.create_user(**user_fields)
