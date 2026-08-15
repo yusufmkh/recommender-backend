@@ -699,14 +699,20 @@ def job_applications(request):
   
   elif request.method == 'POST':
     application = request.data
-    application_job = application.pop('job')
+    # .get, not ['...']: the old unconditional reads ran AFTER the Application
+    # row was saved, so a body missing 'questions'/'attachment_requirements'
+    # 500ed while still creating an orphaned application.
+    application_job = application.get('job')
+    if application_job is None:
+      return Response({'error': 'job is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    application_questions = application.get('questions') or []
+    attachment_requirements = application.get('attachment_requirements') or []
     application_serializer = ApplicationSerializer(data={'user': request.user.id, 'job': application_job})
-    
+
     if application_serializer.is_valid(raise_exception=True):
       application_serializer.save()
 
-      if len(application['questions']) > 0:
-        application_questions = application.pop('questions')
+      if len(application_questions) > 0:
         for application_question in application_questions:
           application_question_serializer = ApplicationQuestionSerializer(data={'application': application_serializer, 'question': application_question['question']})
 
@@ -718,8 +724,7 @@ def job_applications(request):
             if application_answer_serializer.is_valid():
               application_answer_serializer.save()
 
-      if len(application['attachment_requirements']) > 0:
-        attachment_requirements = application.pop('attachment_requirements')
+      if len(attachment_requirements) > 0:
         for attachment_requirement in attachment_requirements:
           attachment_requirement_serializer = AttachmentRequirementSerializer(data={'application': application_serializer, 'attachment_requirement': attachment_requirement['requirement'], 'attachment_type': attachment_requirement['type']})
 
