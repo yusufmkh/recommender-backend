@@ -5,6 +5,9 @@ class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
     model = MyUser
     fields = ['id', 'first_name', 'last_name', 'email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
+    # user_profile PATCH feeds request.data straight into this serializer, so the
+    # privilege/lifecycle flags must never be client-writable.
+    read_only_fields = ['id', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
 
 class CompanyBranchSerializer(serializers.ModelSerializer):
   class Meta:
