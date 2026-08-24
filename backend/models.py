@@ -269,17 +269,37 @@ class AttachmentAnswer(models.Model):
   attachment = models.CharField(max_length=500)
 
 class Conversation(models.Model):
-  creator = models.ForeignKey(get_user_model(), related_name='creator', on_delete=models.CASCADE)
-  recipient = models.ForeignKey(get_user_model(), related_name='recipient', on_delete=models.CASCADE)
-  application = models.ForeignKey(Application, on_delete=models.CASCADE)
+  # One message thread between a candidate and the company owning `job`. Only
+  # the employer may create one (together with its first message), and only when
+  # the candidate was invited to the job or applied to it - so a conversation's
+  # existence implies the candidate has already received an employer message,
+  # which is what makes them allowed to reply.
+  job = models.ForeignKey(Job, related_name='conversations', on_delete=models.CASCADE)
+  candidate = models.ForeignKey(get_user_model(), related_name='conversations', on_delete=models.CASCADE)
+  # Read cursors, one per side. A message is unread for a side when the other
+  # side sent it after this timestamp (null = that side has never opened it).
+  candidate_last_read_at = models.DateTimeField(null=True, blank=True)
+  employer_last_read_at = models.DateTimeField(null=True, blank=True)
   created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    constraints = [
+      # One thread per candidate per job: starting a conversation is idempotent
+      # (get_or_create appends to the existing thread instead of forking a new one).
+      models.UniqueConstraint(fields=['job', 'candidate'], name='unique_conversation_per_job_candidate'),
+    ]
 
 class Message(models.Model):
   conversation = models.ForeignKey(Conversation, related_name='messages', on_delete=models.CASCADE)
-  sender = models.ForeignKey(get_user_model(), related_name='messages', on_delete=models.CASCADE)
-  message = models.TextField(blank=True, null=True)
+  sender = models.ForeignKey(get_user_model(), related_name='sent_messages', on_delete=models.CASCADE)
+  body = models.TextField()
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    ordering = ['created_at']
+    indexes = [models.Index(fields=['conversation', 'created_at'])]
 
 class MessageFile(models.Model):
   message = models.ForeignKey(Message, related_name='message_files', on_delete=models.CASCADE)

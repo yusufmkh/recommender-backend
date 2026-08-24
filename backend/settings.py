@@ -75,6 +75,9 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'password_reset': '5/hour',
         'email_verify': '5/hour',
+        # Message sends only (PostScopedRateThrottle skips reads): spam guard
+        # sized well above any human typing speed.
+        'messages': '30/min',
     },
 }
 

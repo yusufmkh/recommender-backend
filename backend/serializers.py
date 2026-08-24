@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Message, MessageFile
 
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
@@ -148,15 +148,15 @@ class AttachmentAnswerSerializer(serializers.ModelSerializer):
     model = AttachmentAnswer
     fields = '__all__'
 
-class ConversationSerializer(serializers.ModelSerializer):
-  class Meta:
-    model = Conversation
-    fields = '__all__'
-
+# One chat message. `sender` stays a bare user id - the thread payload carries
+# `me`, so the client tells its own messages apart by comparing the two, and no
+# per-message identity (name/email) ever leaves the server. Conversation payloads
+# have no ModelSerializer: the views assemble them per-viewer, because what the
+# counterpart looks like depends on which side is asking.
 class MessageSerializer(serializers.ModelSerializer):
   class Meta:
     model = Message
-    fields = '__all__'
+    fields = ['id', 'sender', 'body', 'created_at']
 
 class MessageFileSerializer(serializers.ModelSerializer):
   class Meta:

@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Count, F, Max, Q
 from django.contrib.auth.tokens import default_token_generator
+from django.utils import timezone
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 
@@ -10,9 +12,9 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework import status
 
-from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message
 
-from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, ConversationSerializer, MessageSerializer, MessageFileSerializer
+from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, MessageSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
@@ -737,6 +739,260 @@ def job_applications(request):
               attachment_answer_serializer.save()
     
       return Response(application_serializer.data, status=status.HTTP_201_CREATED)
-    
+
     else:
       return Response(application_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+# --- Messaging -------------------------------------------------------------
+#
+# Threads are anchored on (job, candidate). Only the employer that owns the job
+# may open one - and only with a candidate they invited to that job or who
+# applied to it - and it is always created together with its first message, so
+# a candidate having a conversation at all means an employer messaged them
+# first, which is exactly the condition for them being allowed to reply.
+
+MESSAGE_MAX_LENGTH = 4000
+
+class PostScopedRateThrottle(ScopedRateThrottle):
+  # Rate-limits writes only, so the GET half of a shared view (the inbox) and
+  # the thread view's polling are never throttled alongside sends.
+  def allow_request(self, request, view):
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+      return True
+    return super().allow_request(request, view)
+
+def _employer_can_message(employer_user, candidate_id, job):
+  # Stricter than _company_can_view_candidate, and deliberately per-job:
+  # shortlisting is not enough, and an application to one job doesn't open
+  # messaging about another (inviting the candidate there does).
+  if job.company is None or job.company.user_id != employer_user.id:
+    return False
+  return (
+    Match.objects.filter(user_id=candidate_id, job=job, is_invited=True).exists()
+    or Application.objects.filter(user_id=candidate_id, job=job).exists()
+  )
+
+def _member_conversations(user):
+  # Every thread the requester belongs to, on whichever side. All reads and
+  # writes below go through this scope, so someone else's conversation is
+  # indistinguishable from one that doesn't exist.
+  return Conversation.objects.filter(Q(candidate=user) | Q(job__company__user=user))
+
+def _conversation_role(conversation, user):
+  # Callers only pass members (see _member_conversations), so not-the-candidate
+  # means the requester owns the job's company.
+  return 'candidate' if conversation.candidate_id == user.id else 'employer'
+
+def _mark_read(conversation, role):
+  field = 'candidate_last_read_at' if role == 'candidate' else 'employer_last_read_at'
+  setattr(conversation, field, timezone.now())
+  conversation.save(update_fields=[field, 'updated_at'])
+
+def _clean_message_body(raw):
+  body = raw.strip() if isinstance(raw, str) else ''
+  if not body:
+    return None, 'Message cannot be empty.'
+  if len(body) > MESSAGE_MAX_LENGTH:
+    return None, f'Message is too long (max {MESSAGE_MAX_LENGTH} characters).'
+  return body, None
+
+def _job_summary(job):
+  return {'id': job.id, 'title': job.title, 'status': job.status}
+
+def _conversation_counterpart(conversation, role):
+  # The other side of the thread, shaped identically for both roles so the
+  # frontend renders either with one component. Candidates see the company,
+  # never the employer user's personal identity; employers see the same lean
+  # candidate subset as CandidateBriefSerializer (no email, no DOB).
+  if role == 'candidate':
+    company = conversation.job.company
+    if company is None:
+      return {'id': None, 'name': 'Company', 'photo': None, 'subtitle': None}
+    return {'id': company.id, 'name': company.name, 'photo': company.photo, 'subtitle': company.city}
+  candidate = conversation.candidate
+  return {
+    'id': candidate.id,
+    'name': f'{candidate.first_name} {candidate.last_name}'.strip(),
+    'photo': candidate.photo,
+    'subtitle': candidate.city,
+  }
+
+def _thread_payload(conversation, user, role, after_id=None):
+  messages = conversation.messages.all()
+  if after_id is not None:
+    # Ids are monotonic and messages append-only, so id-gt matches the
+    # created_at ordering and gives the poller a cheap incremental cursor.
+    messages = messages.filter(pk__gt=after_id)
+  return {
+    'me': user.id,
+    'conversation': {
+      'id': conversation.id,
+      'job': _job_summary(conversation.job),
+      'counterpart': _conversation_counterpart(conversation, role),
+    },
+    'messages': MessageSerializer(messages, many=True).data,
+  }
+
+def _unread_counts(user, conv_ids, read_field):
+  # One query per side: counterpart-sent messages newer than the requester's
+  # read cursor (or all of them where the side has never opened the thread).
+  if not conv_ids:
+    return {}
+  rows = (
+    Message.objects
+    .filter(conversation_id__in=conv_ids)
+    .exclude(sender=user)
+    .filter(
+      Q(created_at__gt=F(f'conversation__{read_field}'))
+      | Q(**{f'conversation__{read_field}__isnull': True})
+    )
+    .values('conversation_id')
+    .annotate(n=Count('id'))
+  )
+  return {row['conversation_id']: row['n'] for row in rows}
+
+def _unread_by_conversation(user, conversations):
+  as_candidate = [c.id for c in conversations if c.candidate_id == user.id]
+  as_employer = [c.id for c in conversations if c.candidate_id != user.id]
+  unread = _unread_counts(user, as_candidate, 'candidate_last_read_at')
+  unread.update(_unread_counts(user, as_employer, 'employer_last_read_at'))
+  return unread
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([PostScopedRateThrottle])
+def conversations(request, format=None):
+  if request.method == 'GET':
+    convs = list(_member_conversations(request.user).select_related('job__company', 'candidate'))
+    conv_ids = [c.id for c in convs]
+
+    # Latest message per thread in two flat queries (ids, then rows), plus two
+    # for unread counts - the inbox stays at five queries however long it gets.
+    last_ids = (
+      Message.objects.filter(conversation_id__in=conv_ids)
+      .values('conversation_id').annotate(last_id=Max('id'))
+    ) if conv_ids else []
+    last_by_conv = {
+      m.conversation_id: m
+      for m in Message.objects.filter(pk__in=[row['last_id'] for row in last_ids])
+    }
+    unread = _unread_by_conversation(request.user, convs)
+
+    def last_activity(conversation):
+      last = last_by_conv.get(conversation.id)
+      return last.created_at if last else conversation.created_at
+
+    convs.sort(key=last_activity, reverse=True)
+
+    summaries = []
+    for conversation in convs:
+      role = _conversation_role(conversation, request.user)
+      last = last_by_conv.get(conversation.id)
+      summaries.append({
+        'id': conversation.id,
+        'job': _job_summary(conversation.job),
+        'counterpart': _conversation_counterpart(conversation, role),
+        'last_message': MessageSerializer(last).data if last else None,
+        'unread_count': unread.get(conversation.id, 0),
+      })
+
+    return Response({'me': request.user.id, 'conversations': summaries})
+
+  elif request.method == 'POST':
+    # Employer-only: opening a thread requires owning the job, so a candidate
+    # body fails the gate below. The first message travels in the same request
+    # (and transaction) - threads are never born empty.
+    try:
+      candidate_id = int(request.data.get('candidate'))
+      job_id = int(request.data.get('job'))
+    except (TypeError, ValueError):
+      return Response({'error': 'candidate and job ids are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    body, error = _clean_message_body(request.data.get('body'))
+    if error:
+      return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+      job = Job.objects.select_related('company').get(pk=job_id)
+    except Job.DoesNotExist:
+      return Response(status=status.HTTP_404_NOT_FOUND)
+
+    if not _employer_can_message(request.user, candidate_id, job):
+      return Response(status=status.HTTP_403_FORBIDDEN)
+
+    with transaction.atomic():
+      # Idempotent: a second "Message" tap appends to the existing thread (the
+      # unique constraint makes the get_or_create race safe).
+      conversation, created = Conversation.objects.get_or_create(job=job, candidate_id=candidate_id)
+      Message.objects.create(conversation=conversation, sender=request.user, body=body)
+      _mark_read(conversation, 'employer')
+
+    return Response(
+      _thread_payload(conversation, request.user, 'employer'),
+      status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+    )
+
+conversations.cls.throttle_scope = 'messages'
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def conversation_details(request, id, format=None):
+  try:
+    conversation = _member_conversations(request.user).select_related('job__company', 'candidate').get(pk=id)
+  except Conversation.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  after_id = None
+  after_raw = request.query_params.get('after')
+  if after_raw is not None:
+    try:
+      after_id = int(after_raw)
+    except (TypeError, ValueError):
+      return Response({'error': 'after must be a message id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  role = _conversation_role(conversation, request.user)
+  # Fetching a thread IS reading it - so the read cursor advances here rather
+  # than through a separate mark-read endpoint. EXCEPT under ?peek=1: the inbox
+  # auto-opens the newest thread in its desktop pane, and that pane is hidden on
+  # mobile - marking it read there would clear an unread badge for messages the
+  # user never saw. A peeked thread gets marked read by the pane's poll loop,
+  # which only runs while the pane is genuinely visible.
+  if request.query_params.get('peek') not in ('1', 'true'):
+    _mark_read(conversation, role)
+
+  return Response(_thread_payload(conversation, request.user, role, after_id=after_id))
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([PostScopedRateThrottle])
+def conversation_messages(request, id, format=None):
+  # Membership is the whole permission here: an employer-side thread only
+  # exists if the gate passed at creation, and being its candidate means an
+  # employer has already messaged you (threads are born with a message).
+  try:
+    conversation = _member_conversations(request.user).select_related('job__company', 'candidate').get(pk=id)
+  except Conversation.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  body, error = _clean_message_body(request.data.get('body'))
+  if error:
+    return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+  message = Message.objects.create(conversation=conversation, sender=request.user, body=body)
+  _mark_read(conversation, _conversation_role(conversation, request.user))
+
+  return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
+
+conversation_messages.cls.throttle_scope = 'messages'
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def conversations_unread_count(request, format=None):
+  # Lightweight badge feed - polled by the nav on both sides.
+  convs = list(_member_conversations(request.user).only('id', 'candidate_id'))
+  unread = _unread_by_conversation(request.user, convs)
+  counts = [n for n in unread.values() if n]
+  return Response({
+    'unread_conversations': len(counts),
+    'unread_messages': sum(counts),
+  })

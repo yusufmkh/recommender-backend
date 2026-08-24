@@ -55,6 +55,12 @@ urlpatterns = [
     path("api/company/saved_candidates/", views.company_saved_candidates, name="company_saved_candidates"),
     path("api/company/saved_candidates/<int:id>/", views.company_saved_candidate_details, name="company_saved_candidate_details"),
     path("api/applications/", views.job_applications, name="applications"),
+    # Messaging. All four routes keep the trailing slash (the site-wide
+    # convention; the slashless ones above are the legacy exceptions).
+    path("api/conversations/", views.conversations, name="conversations"),
+    path("api/conversations/unread_count/", views.conversations_unread_count, name="conversations_unread_count"),
+    path("api/conversations/<int:id>/", views.conversation_details, name="conversation_details"),
+    path("api/conversations/<int:id>/messages/", views.conversation_messages, name="conversation_messages"),
 ]
 
 urlpatterns = format_suffix_patterns(urlpatterns)

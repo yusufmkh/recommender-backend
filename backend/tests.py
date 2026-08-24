@@ -1,12 +1,13 @@
 import datetime
 
+from django.core.cache import cache
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
 
-from .models import MyUser, Company, Job, Match, Application, SavedCandidate, WorkExperience
+from .models import MyUser, Company, Job, Match, Application, SavedCandidate, WorkExperience, Conversation, Message
 from .serializers import MyUserSerializer
 
 class CandidateTests(APITestCase):
@@ -243,3 +244,259 @@ class EmployerShortlistTests(APITestCase):
       self.client.get(reverse('company_dashboard'))
 
     self.assertEqual(len(baseline.captured_queries), len(grown.captured_queries))
+
+
+class MessagingTests(APITestCase):
+  """An employer may only open a thread about a job with a candidate they invited
+  to it or who applied to it; candidates can only ever reply. Threads are created
+  together with their first message, so a thread existing IS the proof the
+  candidate has already been messaged."""
+
+  def _employer(self, slug):
+    user = MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
+      password='pw12345678', is_active=True,
+    )
+    company = Company.objects.create(
+      user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
+      address='1 Road', postcode='E1', city='London', state='London', country='UK',
+    )
+    return user, company
+
+  def _candidate(self, slug):
+    return MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Candidate',
+      password='pw12345678', is_active=True,
+    )
+
+  def setUp(self):
+    self.employer_a, self.company_a = self._employer('alpha')
+    self.employer_b, self.company_b = self._employer('beta')
+
+    self.job_a = Job.objects.create(company=self.company_a, title='Chef', description='Cook')
+    self.job_a2 = Job.objects.create(company=self.company_a, title='Waiter', description='Serve')
+    self.job_b = Job.objects.create(company=self.company_b, title='Barista', description='Pour')
+
+    self.invited = self._candidate('invited')
+    Match.objects.create(user=self.invited, job=self.job_a, is_invited=True, score=80)
+    self.applicant = self._candidate('applicant')
+    Application.objects.create(user=self.applicant, job=self.job_a)
+    self.matched = self._candidate('matched')
+    Match.objects.create(user=self.matched, job=self.job_a, score=60)
+    self.stranger = self._candidate('stranger')
+
+    self.client.force_authenticate(user=self.employer_a)
+
+  def _start(self, candidate, job, body='Hello there'):
+    return self.client.post(
+      reverse('conversations'), {'candidate': candidate.id, 'job': job.id, 'body': body}, format='json',
+    )
+
+  def _send(self, conversation_id, body='Follow-up'):
+    return self.client.post(
+      reverse('conversation_messages', args=[conversation_id]), {'body': body}, format='json',
+    )
+
+  def _thread(self, conversation_id, **params):
+    return self.client.get(reverse('conversation_details', args=[conversation_id]), params)
+
+  def _inbox(self, user=None):
+    if user:
+      self.client.force_authenticate(user=user)
+    return self.client.get(reverse('conversations'))
+
+  def _unread(self, user):
+    self.client.force_authenticate(user=user)
+    return self.client.get(reverse('conversations_unread_count')).data
+
+  # --- the gate ---
+
+  def test_invited_candidate_can_be_messaged(self):
+    response = self._start(self.invited, self.job_a)
+
+    self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+    self.assertEqual(response.data['conversation']['job']['id'], self.job_a.id)
+    self.assertEqual(response.data['conversation']['counterpart']['id'], self.invited.id)
+    self.assertEqual([m['body'] for m in response.data['messages']], ['Hello there'])
+    self.assertTrue(Conversation.objects.filter(job=self.job_a, candidate=self.invited).exists())
+
+  def test_applicant_can_be_messaged(self):
+    self.assertEqual(self._start(self.applicant, self.job_a).status_code, status.HTTP_201_CREATED)
+
+  def test_match_without_invite_is_not_enough(self):
+    response = self._start(self.matched, self.job_a)
+
+    self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+    self.assertEqual(Conversation.objects.count(), 0)
+
+  def test_shortlisting_alone_is_not_enough(self):
+    SavedCandidate.objects.create(company=self.company_a, user=self.stranger)
+
+    self.assertEqual(self._start(self.stranger, self.job_a).status_code, status.HTTP_403_FORBIDDEN)
+
+  def test_application_does_not_open_other_jobs(self):
+    # The applicant applied to job_a only - job_a2 stays closed until they are
+    # invited to it or apply there.
+    self.assertEqual(self._start(self.applicant, self.job_a2).status_code, status.HTTP_403_FORBIDDEN)
+
+  def test_cannot_message_about_another_companys_job(self):
+    Match.objects.create(user=self.invited, job=self.job_b, is_invited=True)
+
+    self.assertEqual(self._start(self.invited, self.job_b).status_code, status.HTTP_403_FORBIDDEN)
+
+  def test_candidate_cannot_start_a_conversation(self):
+    self.client.force_authenticate(user=self.invited)
+
+    self.assertEqual(self._start(self.invited, self.job_a).status_code, status.HTTP_403_FORBIDDEN)
+    self.assertEqual(Conversation.objects.count(), 0)
+
+  # --- thread mechanics ---
+
+  def test_starting_twice_appends_to_one_thread(self):
+    first = self._start(self.invited, self.job_a)
+    second = self._start(self.invited, self.job_a, body='Just checking in')
+
+    self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+    self.assertEqual(second.status_code, status.HTTP_200_OK)
+    self.assertEqual(first.data['conversation']['id'], second.data['conversation']['id'])
+    self.assertEqual(Conversation.objects.count(), 1)
+    self.assertEqual([m['body'] for m in second.data['messages']], ['Hello there', 'Just checking in'])
+
+  def test_candidate_can_reply_once_messaged(self):
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+
+    self.client.force_authenticate(user=self.invited)
+    reply = self._send(conversation_id, body='Thanks, keen to talk')
+    self.assertEqual(reply.status_code, status.HTTP_201_CREATED)
+
+    thread = self._thread(conversation_id)
+    self.assertEqual(thread.status_code, status.HTTP_200_OK)
+    self.assertEqual(thread.data['me'], self.invited.id)
+    # The candidate sees the company as the counterpart, never the employer user.
+    self.assertEqual(thread.data['conversation']['counterpart']['name'], 'alpha Ltd')
+    self.assertEqual([m['body'] for m in thread.data['messages']], ['Hello there', 'Thanks, keen to talk'])
+
+  def test_non_participants_cannot_read_or_write(self):
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+
+    self.client.force_authenticate(user=self.employer_b)
+    self.assertEqual(self._thread(conversation_id).status_code, status.HTTP_404_NOT_FOUND)
+    self.assertEqual(self._send(conversation_id).status_code, status.HTTP_404_NOT_FOUND)
+
+    self.client.force_authenticate(user=self.matched)
+    self.assertEqual(self._thread(conversation_id).status_code, status.HTTP_404_NOT_FOUND)
+    self.assertEqual(self._send(conversation_id).status_code, status.HTTP_404_NOT_FOUND)
+    self.assertEqual(Message.objects.count(), 1)
+
+  def test_message_body_is_validated(self):
+    self.assertEqual(self._start(self.invited, self.job_a, body='').status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(self._start(self.invited, self.job_a, body='   ').status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(self._start(self.invited, self.job_a, body='x' * 4001).status_code, status.HTTP_400_BAD_REQUEST)
+    missing_ids = self.client.post(reverse('conversations'), {'body': 'hi'}, format='json')
+    self.assertEqual(missing_ids.status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(Conversation.objects.count(), 0)
+
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+    self.assertEqual(self._send(conversation_id, body='  ').status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(Message.objects.count(), 1)
+
+  # --- read state ---
+
+  def test_read_cursors_and_unread_counts(self):
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+
+    self.assertEqual(self._unread(self.invited), {'unread_conversations': 1, 'unread_messages': 1})
+    self.assertEqual(self._unread(self.employer_a), {'unread_conversations': 0, 'unread_messages': 0})
+
+    # A peek fetch (the inbox auto-opening its newest thread) must NOT advance
+    # the read cursor - the peeked pane may be hidden on the reader's viewport.
+    self.client.force_authenticate(user=self.invited)
+    self.assertEqual(self._thread(conversation_id, peek=1).status_code, status.HTTP_200_OK)
+    self.assertEqual(self._unread(self.invited), {'unread_conversations': 1, 'unread_messages': 1})
+
+    # Opening the thread advances the candidate's read cursor.
+    self.client.force_authenticate(user=self.invited)
+    self._thread(conversation_id)
+    self.assertEqual(self._unread(self.invited), {'unread_conversations': 0, 'unread_messages': 0})
+
+    self.client.force_authenticate(user=self.invited)
+    self._send(conversation_id, body='Reply one')
+    self._send(conversation_id, body='Reply two')
+    self.assertEqual(self._unread(self.employer_a), {'unread_conversations': 1, 'unread_messages': 2})
+
+    self.client.force_authenticate(user=self.employer_a)
+    self._thread(conversation_id)
+    self.assertEqual(self._unread(self.employer_a), {'unread_conversations': 0, 'unread_messages': 0})
+
+  def test_after_returns_only_new_messages(self):
+    started = self._start(self.invited, self.job_a)
+    conversation_id = started.data['conversation']['id']
+    first_id = started.data['messages'][0]['id']
+
+    self.client.force_authenticate(user=self.invited)
+    self._send(conversation_id, body='Newer')
+
+    self.client.force_authenticate(user=self.employer_a)
+    delta = self._thread(conversation_id, after=first_id)
+    self.assertEqual([m['body'] for m in delta.data['messages']], ['Newer'])
+
+    self.assertEqual(self._thread(conversation_id, after='abc').status_code, status.HTTP_400_BAD_REQUEST)
+
+  # --- inbox ---
+
+  def test_inbox_orders_by_latest_activity_with_counterparts(self):
+    first_id = self._start(self.invited, self.job_a).data['conversation']['id']
+    self._start(self.applicant, self.job_a, body='About your application')
+    # New activity moves the older thread back to the top.
+    self._send(first_id, body='Bumping this')
+
+    inbox = self._inbox().data
+    self.assertEqual(inbox['me'], self.employer_a.id)
+    self.assertEqual([c['id'] for c in inbox['conversations']][0], first_id)
+    top = inbox['conversations'][0]
+    self.assertEqual(top['counterpart']['name'], 'invited Candidate')
+    self.assertEqual(top['last_message']['body'], 'Bumping this')
+    self.assertEqual(top['unread_count'], 0)
+
+    candidate_inbox = self._inbox(user=self.invited).data
+    self.assertEqual(len(candidate_inbox['conversations']), 1)
+    self.assertEqual(candidate_inbox['conversations'][0]['counterpart']['name'], 'alpha Ltd')
+    self.assertEqual(candidate_inbox['conversations'][0]['unread_count'], 2)
+
+  def test_inbox_query_count_does_not_grow_with_conversations(self):
+    self._start(self.invited, self.job_a)
+
+    with CaptureQueriesContext(connection) as baseline:
+      self._inbox()
+
+    self._start(self.applicant, self.job_a)
+    for i in range(3):
+      extra = self._candidate(f'extra{i}')
+      Match.objects.create(user=extra, job=self.job_a2, is_invited=True)
+      conversation_id = self._start(extra, self.job_a2).data['conversation']['id']
+      self._send(conversation_id, body=f'More for {i}')
+
+    with CaptureQueriesContext(connection) as grown:
+      self._inbox()
+
+    self.assertEqual(len(baseline.captured_queries), len(grown.captured_queries))
+
+  # --- throttling ---
+
+  def test_sends_are_throttled_but_reads_are_not(self):
+    from .views import PostScopedRateThrottle
+
+    original_rates = PostScopedRateThrottle.THROTTLE_RATES
+    PostScopedRateThrottle.THROTTLE_RATES = {'messages': '2/min'}
+    cache.clear()
+    try:
+      conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+      self.assertEqual(self._send(conversation_id).status_code, status.HTTP_201_CREATED)
+      # Third write inside the window is refused...
+      self.assertEqual(self._send(conversation_id).status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+      # ...while reads (inbox and the polling thread view) sail through.
+      self.assertEqual(self._inbox().status_code, status.HTTP_200_OK)
+      self.assertEqual(self._thread(conversation_id).status_code, status.HTTP_200_OK)
+    finally:
+      PostScopedRateThrottle.THROTTLE_RATES = original_rates
+      cache.clear()
