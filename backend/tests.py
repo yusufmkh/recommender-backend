@@ -7,7 +7,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
 
-from .models import MyUser, Company, Job, Match, Application, SavedCandidate, WorkExperience, Conversation, Message
+from .models import MyUser, Company, Job, Match, Application, ApplicationEvent, SavedCandidate, WorkExperience, Conversation, Message
 from .serializers import MyUserSerializer
 
 class CandidateTests(APITestCase):
@@ -244,6 +244,339 @@ class EmployerShortlistTests(APITestCase):
       self.client.get(reverse('company_dashboard'))
 
     self.assertEqual(len(baseline.captured_queries), len(grown.captured_queries))
+
+
+class ApplicationTests(APITestCase):
+  """Applying is idempotent and profile-based; the application's status is the
+  shared pipeline state - employers move it through the stages, candidates may
+  only withdraw, and every change lands in the append-only event log."""
+
+  def _employer(self, slug):
+    user = MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
+      password='pw12345678', is_active=True,
+    )
+    company = Company.objects.create(
+      user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
+      address='1 Road', postcode='E1', city='London', state='London', country='UK',
+    )
+    return user, company
+
+  def _candidate(self, slug):
+    return MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Candidate',
+      password='pw12345678', is_active=True,
+    )
+
+  def setUp(self):
+    self.employer, self.company = self._employer('alpha')
+    self.other_employer, self.other_company = self._employer('beta')
+
+    self.job = Job.objects.create(company=self.company, title='Chef', description='Cook')
+    self.closed_job = Job.objects.create(company=self.company, title='Old Chef', description='Cooked', status='h')
+
+    self.candidate = self._candidate('applicant')
+    Match.objects.create(user=self.candidate, job=self.job, score=77)
+
+    # The `applications` throttle counts per user id in the process-wide cache,
+    # and every test re-creates its users with the same ids (DB rollback), so
+    # applies would accumulate across the class and eventually 429.
+    cache.clear()
+
+    self.client.force_authenticate(user=self.candidate)
+
+  def _apply(self, job=None, **extra):
+    return self.client.post(
+      reverse('applications'), {'job': (job or self.job).id, **extra}, format='json',
+    )
+
+  def _detail(self, application_id, user=None):
+    if user:
+      self.client.force_authenticate(user=user)
+    return self.client.get(reverse('application_detail', args=[application_id]))
+
+  def _set_status(self, application_id, new_status, user=None, **extra):
+    if user:
+      self.client.force_authenticate(user=user)
+    return self.client.patch(
+      reverse('application_detail', args=[application_id]), {'status': new_status, **extra}, format='json',
+    )
+
+  # --- applying ---
+
+  def test_apply_creates_application_with_event_and_cover_letter(self):
+    response = self._apply(cover_letter='  I cook well.  ')
+
+    self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+    self.assertEqual(response.data['status'], 'a')
+    self.assertEqual(response.data['cover_letter'], 'I cook well.')
+    application = Application.objects.get(pk=response.data['id'])
+    self.assertEqual(application.user, self.candidate)
+    events = list(application.events.all())
+    self.assertEqual([(e.from_status, e.to_status) for e in events], [('', 'a')])
+    self.assertEqual(events[0].actor, self.candidate)
+
+  def test_duplicate_apply_is_idempotent(self):
+    first = self._apply()
+    second = self._apply()
+
+    self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+    self.assertEqual(second.status_code, status.HTTP_200_OK)
+    self.assertEqual(first.data['id'], second.data['id'])
+    self.assertTrue(second.data.get('already_applied'))
+    self.assertEqual(Application.objects.filter(user=self.candidate, job=self.job).count(), 1)
+    self.assertEqual(ApplicationEvent.objects.count(), 1)
+
+  def test_cannot_apply_to_a_closed_job(self):
+    response = self._apply(job=self.closed_job)
+
+    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertFalse(Application.objects.exists())
+
+  def test_employer_cannot_apply_to_their_own_job(self):
+    self.client.force_authenticate(user=self.employer)
+
+    self.assertEqual(self._apply().status_code, status.HTTP_403_FORBIDDEN)
+    self.assertFalse(Application.objects.exists())
+
+  def test_apply_validates_body(self):
+    missing = self.client.post(reverse('applications'), {}, format='json')
+    self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
+
+    too_long = self._apply(cover_letter='x' * 4001)
+    self.assertEqual(too_long.status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertFalse(Application.objects.exists())
+
+  def test_client_cannot_smuggle_status_or_user_on_create(self):
+    stranger = self._candidate('stranger')
+    response = self._apply(status='h', user=stranger.id)
+
+    self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+    application = Application.objects.get(pk=response.data['id'])
+    self.assertEqual(application.status, 'a')
+    self.assertEqual(application.user, self.candidate)
+
+  def test_candidate_list_includes_events(self):
+    application_id = self._apply().data['id']
+
+    payload = self.client.get(reverse('applications')).data
+    self.assertEqual([a['id'] for a in payload['user_applications']], [application_id])
+    self.assertEqual(
+      [(e['application'], e['to_status']) for e in payload['application_events']],
+      [(application_id, 'a')],
+    )
+    # Candidate-safe shape: employer-internal notes never appear here.
+    self.assertNotIn('note', payload['application_events'][0])
+
+  # --- the employer pipeline ---
+
+  def test_employer_moves_application_through_stages(self):
+    application_id = self._apply().data['id']
+
+    for stage in ('s', 'i', 't', 'h'):
+      response = self._set_status(application_id, stage, user=self.employer)
+      self.assertEqual(response.status_code, status.HTTP_200_OK)
+      self.assertEqual(response.data['status'], stage)
+
+    events = [(e.from_status, e.to_status) for e in Application.objects.get(pk=application_id).events.all()]
+    self.assertEqual(events, [('', 'a'), ('a', 's'), ('s', 'i'), ('i', 't'), ('t', 'h')])
+
+  def test_employer_note_is_recorded_but_hidden_from_the_candidate(self):
+    application_id = self._apply().data['id']
+    self._set_status(application_id, 'r', user=self.employer, note='Not enough experience')
+
+    employer_view = self._detail(application_id, user=self.employer)
+    self.assertIn('Not enough experience', [e['note'] for e in employer_view.data['events']])
+
+    candidate_view = self._detail(application_id, user=self.candidate)
+    self.assertEqual(candidate_view.status_code, status.HTTP_200_OK)
+    for event in candidate_view.data['events']:
+      self.assertNotIn('note', event)
+
+  def test_employer_cannot_set_withdrawn_or_garbage(self):
+    application_id = self._apply().data['id']
+
+    self.assertEqual(self._set_status(application_id, 'w', user=self.employer).status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(self._set_status(application_id, 'z', user=self.employer).status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(Application.objects.get(pk=application_id).status, 'a')
+
+  def test_non_participants_get_404(self):
+    application_id = self._apply().data['id']
+
+    self.assertEqual(self._detail(application_id, user=self.other_employer).status_code, status.HTTP_404_NOT_FOUND)
+    self.assertEqual(self._set_status(application_id, 's', user=self.other_employer).status_code, status.HTTP_404_NOT_FOUND)
+
+    stranger = self._candidate('stranger')
+    self.assertEqual(self._detail(application_id, user=stranger).status_code, status.HTTP_404_NOT_FOUND)
+
+  def test_employer_get_marks_application_viewed(self):
+    application_id = self._apply().data['id']
+    self.assertIsNone(Application.objects.get(pk=application_id).employer_viewed_at)
+
+    # The candidate's own reads never mark it viewed.
+    self._detail(application_id, user=self.candidate)
+    self.assertIsNone(Application.objects.get(pk=application_id).employer_viewed_at)
+
+    response = self._detail(application_id, user=self.employer)
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertIsNotNone(Application.objects.get(pk=application_id).employer_viewed_at)
+    self.assertEqual(response.data['candidate']['id'], self.candidate.id)
+    self.assertEqual(response.data['job']['id'], self.job.id)
+
+  # --- withdrawing ---
+
+  def test_candidate_can_withdraw_and_reapply(self):
+    application_id = self._apply().data['id']
+
+    withdrawn = self._set_status(application_id, 'w')
+    self.assertEqual(withdrawn.status_code, status.HTTP_200_OK)
+    self.assertEqual(withdrawn.data['status'], 'w')
+
+    # A withdrawn application is frozen for the employer...
+    conflict = self._set_status(application_id, 'i', user=self.employer)
+    self.assertEqual(conflict.status_code, status.HTTP_409_CONFLICT)
+
+    # ...and re-applying reactivates the SAME row rather than inserting another.
+    self.client.force_authenticate(user=self.candidate)
+    reapplied = self._apply(cover_letter='Second time lucky')
+    self.assertEqual(reapplied.status_code, status.HTTP_200_OK)
+    self.assertTrue(reapplied.data.get('reactivated'))
+    self.assertEqual(reapplied.data['id'], application_id)
+    self.assertEqual(Application.objects.count(), 1)
+
+    application = Application.objects.get(pk=application_id)
+    self.assertEqual(application.status, 'a')
+    self.assertEqual(application.cover_letter, 'Second time lucky')
+    events = [(e.from_status, e.to_status) for e in application.events.all()]
+    self.assertEqual(events, [('', 'a'), ('a', 'w'), ('w', 'a')])
+
+  def test_candidate_cannot_set_anything_but_withdrawn(self):
+    application_id = self._apply().data['id']
+
+    for stage in ('s', 'i', 't', 'h', 'r'):
+      self.assertEqual(self._set_status(application_id, stage).status_code, status.HTTP_403_FORBIDDEN)
+    self.assertEqual(Application.objects.get(pk=application_id).status, 'a')
+
+  def test_candidate_cannot_withdraw_after_an_outcome(self):
+    application_id = self._apply().data['id']
+    self._set_status(application_id, 'h', user=self.employer)
+
+    response = self._set_status(application_id, 'w', user=self.candidate)
+    self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+    self.assertEqual(Application.objects.get(pk=application_id).status, 'h')
+
+  # --- the employer dashboard ---
+
+  def test_dashboard_applicant_rows_carry_the_candidate_brief_and_score(self):
+    self._apply()
+
+    self.client.force_authenticate(user=self.employer)
+    dashboard = self.client.get(reverse('company_dashboard')).data
+    self.assertEqual(len(dashboard['job_applicants']), 1)
+    row = dashboard['job_applicants'][0]
+    self.assertEqual(row['candidate']['id'], self.candidate.id)
+    self.assertEqual(row['candidate']['first_name'], 'applicant')
+    self.assertEqual(row['score'], 77)
+    self.assertEqual(row['job'], self.job.id)
+    self.assertIsNone(row['employer_viewed_at'])
+    # The brief never leaks contact or lifecycle fields.
+    self.assertNotIn('email', row['candidate'])
+    # No work history at all -> None, distinguishable from "less than a month".
+    self.assertIsNone(row['total_experience_months'])
+
+    WorkExperience.objects.create(
+      user=self.candidate, job_title='Chef de Partie', description='...',
+      start_date=datetime.date(2023, 1, 1), end_date=datetime.date(2024, 9, 1),
+    )
+    refreshed = self.client.get(reverse('company_dashboard')).data
+    self.assertEqual(refreshed['job_applicants'][0]['total_experience_months'], 20)
+
+  def test_dashboard_refuses_non_employers(self):
+    response = self.client.get(reverse('company_dashboard'))
+
+    self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+  # --- status changes land in the message thread ---
+
+  def _unread(self, user):
+    self.client.force_authenticate(user=user)
+    return self.client.get(reverse('conversations_unread_count')).data
+
+  def test_employer_status_change_messages_the_candidate(self):
+    application_id = self._apply().data['id']
+
+    self._set_status(application_id, 's', user=self.employer)
+
+    conversation = Conversation.objects.get(job=self.job, candidate=self.candidate)
+    messages = list(conversation.messages.all())
+    self.assertEqual(len(messages), 1)
+    self.assertEqual(messages[0].sender, self.employer)
+    self.assertEqual(messages[0].body, 'Good news — your application for Chef has been shortlisted.')
+    # The candidate's badge lights up; the employer's own message never counts for them.
+    self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 1})
+    self.assertEqual(self._unread(self.employer), {'unread_conversations': 0, 'unread_messages': 0})
+
+    # A second change appends to the SAME thread rather than forking one.
+    self._set_status(application_id, 'i', user=self.employer)
+    self.assertEqual(Conversation.objects.count(), 1)
+    bodies = [m.body for m in conversation.messages.all()]
+    self.assertEqual(bodies[-1], 'Your application for Chef has moved to the interview stage.')
+    self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 2})
+
+  def test_note_only_and_noop_patches_send_no_message(self):
+    application_id = self._apply().data['id']
+    self._set_status(application_id, 's', user=self.employer, note='Strong CV')
+    self._set_status(application_id, 's', user=self.employer, note='Second look')
+    self._set_status(application_id, 's', user=self.employer)
+
+    bodies = [m.body for m in Message.objects.all()]
+    self.assertEqual(len(bodies), 1)
+    # Internal notes never leave the server, least of all into the candidate's thread.
+    self.assertNotIn('Strong CV', bodies[0])
+    self.assertNotIn('Second look', bodies[0])
+
+  def test_withdrawal_only_messages_an_existing_thread(self):
+    application_id = self._apply().data['id']
+
+    # No thread yet: withdrawing must not open one - candidates never start threads.
+    self._set_status(application_id, 'w', user=self.candidate)
+    self.assertEqual(Conversation.objects.count(), 0)
+
+    # Re-apply (still no thread, still silent), get shortlisted (thread
+    # created by the employer's change), then withdraw again.
+    self.client.force_authenticate(user=self.candidate)
+    self._apply()
+    self.assertEqual(Conversation.objects.count(), 0)
+    self._set_status(application_id, 's', user=self.employer)
+    self._set_status(application_id, 'w', user=self.candidate)
+
+    conversation = Conversation.objects.get(job=self.job, candidate=self.candidate)
+    last = conversation.messages.last()
+    self.assertEqual(last.sender, self.candidate)
+    self.assertEqual(last.body, 'I’ve withdrawn my application for Chef.')
+    self.assertEqual(self._unread(self.employer), {'unread_conversations': 1, 'unread_messages': 1})
+
+    # Re-applying into the existing thread tells the employer too.
+    self.client.force_authenticate(user=self.candidate)
+    self.assertTrue(self._apply().data.get('reactivated'))
+    self.assertEqual(conversation.messages.last().body, 'I’ve re-applied for Chef.')
+    self.assertEqual(Conversation.objects.count(), 1)
+
+  # --- throttling ---
+
+  def test_applies_are_throttled_but_reads_are_not(self):
+    from .views import PostScopedRateThrottle
+
+    original_rates = PostScopedRateThrottle.THROTTLE_RATES
+    PostScopedRateThrottle.THROTTLE_RATES = {'applications': '1/hour', 'messages': '30/min'}
+    cache.clear()
+    try:
+      self.assertEqual(self._apply().status_code, status.HTTP_201_CREATED)
+      self.assertEqual(self._apply(job=self.closed_job).status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+      self.assertEqual(self.client.get(reverse('applications')).status_code, status.HTTP_200_OK)
+    finally:
+      PostScopedRateThrottle.THROTTLE_RATES = original_rates
+      cache.clear()
 
 
 class MessagingTests(APITestCase):

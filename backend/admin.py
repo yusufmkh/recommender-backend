@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import MyUser, Job, Company, CompanyBranch, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
+from .models import MyUser, Job, Company, CompanyBranch, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationEvent, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message, MessageFile
 
 class UserAdminConfig(UserAdmin):
   search_fields = ('email', 'user_name', 'first_name', 'last_name')
@@ -28,7 +28,17 @@ admin.site.register(Preference)
 admin.site.register(SavedJob)
 admin.site.register(SavedCandidate)
 admin.site.register(Match)
-admin.site.register(Application)
+class ApplicationAdmin(admin.ModelAdmin):
+  list_display = ('id', 'user', 'job', 'status', 'created_at', 'updated_at')
+  list_filter = ('status',)
+  search_fields = ('user__email', 'user__user_name', 'job__title')
+
+class ApplicationEventAdmin(admin.ModelAdmin):
+  list_display = ('id', 'application', 'actor', 'from_status', 'to_status', 'created_at')
+  list_filter = ('to_status',)
+
+admin.site.register(Application, ApplicationAdmin)
+admin.site.register(ApplicationEvent, ApplicationEventAdmin)
 admin.site.register(ApplicationQuestion)
 admin.site.register(ApplicationAnswer)
 admin.site.register(AttachmentRequirement)

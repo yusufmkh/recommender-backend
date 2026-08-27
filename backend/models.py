@@ -24,6 +24,9 @@ APPLICATION_STATUSES = (
   ('t', 'Trial'),
   ('h', 'Hired'),
   ('r', 'Rejected'),
+  # Candidate-owned terminal state: only the applicant may set it, and an
+  # employer can no longer progress the application once it is set.
+  ('w', 'Withdrawn'),
   )
 
 COMPANY_SIZES = (
@@ -244,8 +247,43 @@ class Application(models.Model):
     choices=APPLICATION_STATUSES,
     default='a'
     )
+  # Optional note to the employer, captured once at apply time.
+  cover_letter = models.TextField(blank=True, default='')
+  # Set the first time the job's employer opens the application - drives the
+  # "new applicant" indicator without any notification infrastructure.
+  employer_viewed_at = models.DateTimeField(null=True, blank=True)
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    ordering = ['-created_at']
+    indexes = [models.Index(fields=['job', 'status'])]
+    constraints = [
+      # One application per candidate per job. Re-applying after a withdrawal
+      # reactivates the existing row (see job_applications POST) instead of
+      # inserting a second one, and the constraint makes that race safe.
+      models.UniqueConstraint(fields=['user', 'job'], name='unique_application_per_user_job'),
+    ]
+
+  def __str__(self):
+    return f"{self.user.user_name} - {self.job.title} ({self.status})"
+
+class ApplicationEvent(models.Model):
+  # Append-only audit trail of an application's lifecycle: one row per status
+  # change (including the initial apply), so the candidate timeline can date
+  # every stage and employers can see who moved a candidate and when.
+  application = models.ForeignKey(Application, related_name='events', on_delete=models.CASCADE)
+  actor = models.ForeignKey(get_user_model(), related_name='application_events', null=True, blank=True, on_delete=models.SET_NULL)
+  # Blank from_status marks the initial apply event.
+  from_status = models.CharField(max_length=1, choices=APPLICATION_STATUSES, blank=True, default='')
+  to_status = models.CharField(max_length=1, choices=APPLICATION_STATUSES)
+  # Employer-internal note (e.g. a rejection reason). Never serialized to the
+  # candidate - see ApplicationEventSerializer vs its employer variant.
+  note = models.TextField(blank=True, default='')
+  created_at = models.DateTimeField(auto_now_add=True)
+
+  class Meta:
+    ordering = ['created_at']
 
 class ApplicationQuestion(models.Model):
   application = models.ForeignKey(Application, related_name='application_questions', on_delete=models.CASCADE)

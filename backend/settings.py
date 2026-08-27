@@ -78,6 +78,9 @@ REST_FRAMEWORK = {
         # Message sends only (PostScopedRateThrottle skips reads): spam guard
         # sized well above any human typing speed.
         'messages': '30/min',
+        # Application submissions only (creates are idempotent, so retries are
+        # cheap); GET list/polling is never throttled.
+        'applications': '20/hour',
     },
 }
 

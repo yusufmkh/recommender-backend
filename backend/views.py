@@ -10,11 +10,11 @@ from rest_framework.decorators import api_view, permission_classes, throttle_cla
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
-from rest_framework import status
+from rest_framework import serializers, status
 
-from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationEvent, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message
 
-from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, ApplicationSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, MessageSerializer
+from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, CandidateBriefSerializer, ApplicationSerializer, ApplicationEventSerializer, EmployerApplicationEventSerializer, ApplicantRowSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, MessageSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
@@ -74,6 +74,14 @@ def _company_can_view_candidate(employer, candidate_id):
     or Application.objects.filter(user_id=candidate_id, job__company__user=employer).exists()
     or SavedCandidate.objects.filter(user_id=candidate_id, company__user=employer).exists()
   )
+
+class PostScopedRateThrottle(ScopedRateThrottle):
+  # Rate-limits writes only, so the GET half of a shared view (an inbox, a
+  # list) and any polling are never throttled alongside sends.
+  def allow_request(self, request, view):
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+      return True
+    return super().allow_request(request, view)
 
 def _get_or_create_skills(skill_names):
   # Skills are sent as a list of names; names are normalized (trimmed and
@@ -463,9 +471,20 @@ def photo_presign(request, format=None):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def company_dashboard(request, format=None):
-  company_info = Company.objects.get(user=request.user)
+  try:
+    company_info = Company.objects.get(user=request.user)
+  except Company.DoesNotExist:
+    # A candidate token landing here is "not an employer", not a server error.
+    return Response(status=status.HTTP_403_FORBIDDEN)
   company_jobs, all_matches, rows = _company_candidates(company_info)
-  job_applicants = Application.objects.filter(job__in=company_jobs)
+  # work_experiences feed ApplicantRowSerializer.total_experience_months -
+  # prefetched so the applicant list stays query-flat however long it gets.
+  job_applicants = Application.objects.filter(job__in=company_jobs).select_related('user').prefetch_related('user__work_experiences')
+
+  # Recommender scores keyed per (candidate, job) so each applicant row can
+  # carry the score for the exact job they applied to. `all_matches` is already
+  # evaluated inside _company_candidates, so this adds no query.
+  applicant_scores = {(m.user_id, m.job_id): m.score for m in all_matches if m.score is not None}
 
   # Saving a candidate moves them off the matched list and onto the shortlist.
   # Both keys carry the same shape, so the two pages share one serializer.
@@ -480,7 +499,7 @@ def company_dashboard(request, format=None):
 
   company_info_serializer = CompanySerializer(company_info)
   company_jobs_serializer = JobSerializer(company_jobs.select_related('branch', 'company').prefetch_related('skills'), many=True)
-  job_applicants_serializer = ApplicationSerializer(job_applicants, many=True)
+  job_applicants_serializer = ApplicantRowSerializer(job_applicants, many=True, context={'scores': applicant_scores})
 
   return Response(
     {
@@ -675,73 +694,225 @@ def company_saved_candidate_details(request, id, format=None):
     saved_candidate.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
 
+# --- Applications -----------------------------------------------------------
+
+COVER_LETTER_MAX_LENGTH = 4000
+# The live, pre-outcome stages a candidate may still withdraw from.
+CANDIDATE_WITHDRAWABLE_STATUSES = ('a', 's', 'i', 't')
+# Everything an employer may set. 'w' is candidate-owned; the rest may be set
+# (and re-set) freely so a mis-click is always reversible.
+EMPLOYER_SETTABLE_STATUSES = ('a', 's', 'i', 't', 'h', 'r')
+
+def _status_change_message(job, new_status):
+  # What the candidate reads in their thread when the employer moves them.
+  # Company-voiced, neutral, and no promises the product can't keep ("we'll
+  # be in touch") - the employer messages in-app if they want to say more.
+  title = job.title
+  return {
+    'a': f'Your application for {title} is back under review.',
+    's': f'Good news — your application for {title} has been shortlisted.',
+    'i': f'Your application for {title} has moved to the interview stage.',
+    't': f'Your application for {title} has moved to the trial stage.',
+    'h': f'Congratulations — you’ve been hired for {title}!',
+    'r': f'Thank you for applying for {title}. Unfortunately your application hasn’t been taken forward this time.',
+  }[new_status]
+
+def _notify_status_change(application, actor, role, new_status):
+  # Every status change lands in the (job, candidate) message thread, so the
+  # other side's inbox and nav badge light up with no notification infra.
+  # Employer changes CREATE the thread if needed - the same gate an explicit
+  # "Message" passes (they own the job, the candidate applied). Candidate
+  # changes (withdraw / re-apply) only APPEND to an existing thread: a thread
+  # existing must keep meaning "an employer messaged first", which is the
+  # whole candidate-side messaging permission. The employer's internal note is
+  # deliberately never part of any body.
+  if role == 'employer':
+    conversation, _ = Conversation.objects.get_or_create(job=application.job, candidate=application.user)
+    body = _status_change_message(application.job, new_status)
+  else:
+    conversation = Conversation.objects.filter(job=application.job, candidate=application.user).first()
+    if conversation is None:
+      return
+    if new_status == 'w':
+      body = f'I’ve withdrawn my application for {application.job.title}.'
+    else:
+      body = f'I’ve re-applied for {application.job.title}.'
+  Message.objects.create(conversation=conversation, sender=actor, body=body)
+  # The acting side has, by construction, read its own message.
+  _mark_read(conversation, role)
+
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PostScopedRateThrottle])
 def job_applications(request):
   if request.method == 'GET':
     user_applications = Application.objects.filter(user=request.user)
+    application_events = ApplicationEvent.objects.filter(application__in=user_applications)
+    # Legacy per-application questions/attachments. Nothing writes them any
+    # more (the apply flow is profile + cover letter), but the lists stay so
+    # existing rows keep rendering and the payload shape stays stable.
     user_application_questions = ApplicationQuestion.objects.filter(application__in=user_applications)
     user_application_answers = ApplicationAnswer.objects.filter(application_question__in=user_application_questions)
     attachment_requirements = AttachmentRequirement.objects.filter(application__in=user_applications)
     attachment_answers = AttachmentAnswer.objects.filter(attachment_requirement__in=attachment_requirements)
 
-    user_applications_serializer = ApplicationSerializer(user_applications, many=True)
-    user_application_questions_serializer = ApplicationQuestionSerializer(user_application_questions, many=True)
-    user_application_answers_serializer = ApplicationAnswerSerializer(user_application_answers, many=True)
-    attachment_requirements_serializer = AttachmentRequirementSerializer(attachment_requirements, many=True)
-    attachment_answers_serializer = AttachmentAnswerSerializer(attachment_answers, many=True)
-
     return Response({
-      "user_applications": user_applications_serializer.data,
-      "user_application_questions": user_application_questions_serializer.data,
-      "user_application_answers": user_application_answers_serializer.data,
-      "attachment_requirements": attachment_requirements_serializer.data,
-      "attachment_answers": attachment_answers_serializer.data,
+      "user_applications": ApplicationSerializer(user_applications, many=True).data,
+      # Candidate-safe events (no employer notes), flat like the other lists.
+      "application_events": ApplicationEventSerializer(application_events, many=True).data,
+      "user_application_questions": ApplicationQuestionSerializer(user_application_questions, many=True).data,
+      "user_application_answers": ApplicationAnswerSerializer(user_application_answers, many=True).data,
+      "attachment_requirements": AttachmentRequirementSerializer(attachment_requirements, many=True).data,
+      "attachment_answers": AttachmentAnswerSerializer(attachment_answers, many=True).data,
     })
-  
+
   elif request.method == 'POST':
-    application = request.data
-    # .get, not ['...']: the old unconditional reads ran AFTER the Application
-    # row was saved, so a body missing 'questions'/'attachment_requirements'
-    # 500ed while still creating an orphaned application.
-    application_job = application.get('job')
-    if application_job is None:
+    body = request.data
+    try:
+      job_id = int(body.get('job'))
+    except (TypeError, ValueError):
       return Response({'error': 'job is required.'}, status=status.HTTP_400_BAD_REQUEST)
-    application_questions = application.get('questions') or []
-    attachment_requirements = application.get('attachment_requirements') or []
-    application_serializer = ApplicationSerializer(data={'user': request.user.id, 'job': application_job})
 
-    if application_serializer.is_valid(raise_exception=True):
-      application_serializer.save()
+    cover_letter = body.get('cover_letter') or ''
+    if not isinstance(cover_letter, str):
+      return Response({'error': 'cover_letter must be a string.'}, status=status.HTTP_400_BAD_REQUEST)
+    cover_letter = cover_letter.strip()
+    if len(cover_letter) > COVER_LETTER_MAX_LENGTH:
+      return Response({'error': f'Cover letter is too long (max {COVER_LETTER_MAX_LENGTH} characters).'}, status=status.HTTP_400_BAD_REQUEST)
 
-      if len(application_questions) > 0:
-        for application_question in application_questions:
-          application_question_serializer = ApplicationQuestionSerializer(data={'application': application_serializer, 'question': application_question['question']})
+    try:
+      job = Job.objects.select_related('company').get(pk=job_id)
+    except Job.DoesNotExist:
+      return Response({'error': 'Job not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-          if application_question_serializer.is_valid():
-            application_question_serializer.save()
+    if job.company is not None and job.company.user_id == request.user.id:
+      return Response({'error': 'You cannot apply to your own job.'}, status=status.HTTP_403_FORBIDDEN)
 
-            application_answer_serializer = ApplicationAnswerSerializer(data={'application_question': application_question_serializer, 'answer': application_question['answer']})
+    if job.status != 'a':
+      return Response({'error': 'This job is no longer accepting applications.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            if application_answer_serializer.is_valid():
-              application_answer_serializer.save()
+    with transaction.atomic():
+      # Idempotent: a duplicate submit (double-click, racing tabs) returns the
+      # existing application - the unique constraint makes the race safe.
+      application, created = Application.objects.get_or_create(
+        user=request.user, job=job, defaults={'cover_letter': cover_letter},
+      )
 
-      if len(attachment_requirements) > 0:
-        for attachment_requirement in attachment_requirements:
-          attachment_requirement_serializer = AttachmentRequirementSerializer(data={'application': application_serializer, 'attachment_requirement': attachment_requirement['requirement'], 'attachment_type': attachment_requirement['type']})
+      reactivated = False
+      if created:
+        ApplicationEvent.objects.create(application=application, actor=request.user, from_status='', to_status='a')
+      elif application.status == 'w':
+        # Re-applying after a withdrawal reactivates the same row, keeping the
+        # one-application-per-job invariant and the full event history.
+        ApplicationEvent.objects.create(application=application, actor=request.user, from_status='w', to_status='a')
+        application.status = 'a'
+        if cover_letter:
+          application.cover_letter = cover_letter
+        application.save()
+        reactivated = True
+        # Tell the employer - but only inside a thread they already opened.
+        _notify_status_change(application, request.user, 'candidate', 'a')
 
-          if attachment_requirement_serializer.is_valid():
-            attachment_requirement_serializer.save()
+    data = ApplicationSerializer(application).data
+    if reactivated:
+      data['reactivated'] = True
+    elif not created:
+      # Still-live duplicate: tell the client so it can route to the existing
+      # application instead of showing a fresh confirmation.
+      data['already_applied'] = True
+    return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
-            attachment_answer_serializer = AttachmentAnswerSerializer(data={'attachment_requirement': attachment_requirement_serializer, 'attachment': attachment_requirement['attachment']})
+job_applications.cls.throttle_scope = 'applications'
 
-            if attachment_answer_serializer.is_valid():
-              attachment_answer_serializer.save()
-    
-      return Response(application_serializer.data, status=status.HTTP_201_CREATED)
+def _application_role(application, user):
+  # Callers only pass rows the requester may see (the scoped queryset in
+  # application_detail). The applicant wins if both sides somehow match
+  # (legacy self-applications predating the own-job guard above).
+  return 'candidate' if application.user_id == user.id else 'employer'
 
-    else:
-      return Response(application_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+def _application_payload(application, role):
+  # One application, fully joined for its detail page. Unlike the flat lists,
+  # `job` is nested here (JobSerializer) and employers additionally get the
+  # candidate brief and the employer-internal event notes.
+  payload = ApplicationSerializer(application).data
+  payload['viewer'] = role
+  payload['job'] = JobSerializer(application.job).data
+  event_serializer = EmployerApplicationEventSerializer if role == 'employer' else ApplicationEventSerializer
+  payload['events'] = event_serializer(application.events.all(), many=True).data
+  if role == 'employer':
+    payload['candidate'] = CandidateBriefSerializer(application.user).data
+    payload['employer_viewed_at'] = serializers.DateTimeField().to_representation(application.employer_viewed_at) if application.employer_viewed_at else None
+  return payload
+
+def _mark_employer_viewed(application):
+  if application.employer_viewed_at is None:
+    application.employer_viewed_at = timezone.now()
+    application.save(update_fields=['employer_viewed_at'])
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def application_detail(request, id, format=None):
+  # Requester-scoped like conversations: the applicant and the employer owning
+  # the job see it; for anyone else the row is indistinguishable from missing.
+  try:
+    application = (
+      Application.objects
+      .filter(Q(user=request.user) | Q(job__company__user=request.user))
+      .select_related('user', 'job__company', 'job__branch')
+      .get(pk=id)
+    )
+  except Application.DoesNotExist:
+    return Response(status=status.HTTP_404_NOT_FOUND)
+
+  role = _application_role(application, request.user)
+
+  if request.method == 'GET':
+    if role == 'employer':
+      # Opening an application is what clears its "new applicant" indicator.
+      _mark_employer_viewed(application)
+    return Response(_application_payload(application, role))
+
+  # PATCH: the only mutable field is `status` (plus an employer-internal note
+  # on the event); who may set what depends on the side making the request.
+  new_status = request.data.get('status')
+  note = request.data.get('note') or ''
+
+  if role == 'candidate':
+    if new_status != 'w':
+      return Response({'error': 'Candidates may only withdraw an application.'}, status=status.HTTP_403_FORBIDDEN)
+    if application.status not in CANDIDATE_WITHDRAWABLE_STATUSES:
+      return Response({'error': 'This application can no longer be withdrawn.'}, status=status.HTTP_409_CONFLICT)
+    note = ''
+  else:
+    if new_status not in EMPLOYER_SETTABLE_STATUSES:
+      return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
+    if application.status == 'w':
+      return Response({'error': 'This application was withdrawn by the candidate.'}, status=status.HTTP_409_CONFLICT)
+    if not isinstance(note, str):
+      return Response({'error': 'note must be a string.'}, status=status.HTTP_400_BAD_REQUEST)
+    note = note.strip()
+    if len(note) > 2000:
+      return Response({'error': 'Note is too long (max 2000 characters).'}, status=status.HTTP_400_BAD_REQUEST)
+    # Acting on an application also counts as having seen it.
+    _mark_employer_viewed(application)
+
+  if new_status == application.status and not note:
+    # No-op re-set (e.g. a retried request): succeed without a phantom event.
+    return Response(_application_payload(application, role))
+
+  previous_status = application.status
+  with transaction.atomic():
+    ApplicationEvent.objects.create(
+      application=application, actor=request.user,
+      from_status=previous_status, to_status=new_status, note=note,
+    )
+    application.status = new_status
+    application.save(update_fields=['status', 'updated_at'])
+    # A note-only re-set of the same status is an internal event, not news.
+    if new_status != previous_status:
+      _notify_status_change(application, request.user, role, new_status)
+
+  return Response(_application_payload(application, role))
 
 # --- Messaging -------------------------------------------------------------
 #
@@ -752,14 +923,6 @@ def job_applications(request):
 # first, which is exactly the condition for them being allowed to reply.
 
 MESSAGE_MAX_LENGTH = 4000
-
-class PostScopedRateThrottle(ScopedRateThrottle):
-  # Rate-limits writes only, so the GET half of a shared view (the inbox) and
-  # the thread view's polling are never throttled alongside sends.
-  def allow_request(self, request, view):
-    if request.method in ('GET', 'HEAD', 'OPTIONS'):
-      return True
-    return super().allow_request(request, view)
 
 def _employer_can_message(employer_user, candidate_id, job):
   # Stricter than _company_can_view_candidate, and deliberately per-job:

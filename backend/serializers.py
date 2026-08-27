@@ -1,5 +1,7 @@
+import datetime
+
 from rest_framework import serializers
-from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Message, MessageFile
+from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationEvent, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Message, MessageFile
 
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
@@ -124,9 +126,66 @@ class CompanyCandidateSerializer(serializers.Serializer):
     return serializers.DateTimeField().to_representation(latest) if latest else None
 
 class ApplicationSerializer(serializers.ModelSerializer):
+  # Read shape for the candidate dashboard/list and the create response.
+  # `user` and `job` stay scalar ids (no depth) - both frontends join them
+  # against rows they already hold in the same payload.
+  cover_letter = serializers.CharField(required=False, allow_blank=True, max_length=4000)
+
   class Meta:
     model = Application
-    fields = '__all__'
+    fields = ['id', 'user', 'job', 'status', 'cover_letter', 'created_at', 'updated_at']
+    # Lifecycle fields have dedicated write paths (application_detail PATCH);
+    # nothing client-supplied may set them on create. `user` always comes from
+    # the token via save(user=...), never from the body.
+    read_only_fields = ['user', 'status', 'created_at', 'updated_at']
+
+# Candidate-safe event shape: no `note` (employer-internal) and no actor
+# identity. `application` stays a scalar id so the flat list in GET
+# /api/applications/ can be joined client-side like its sibling lists.
+class ApplicationEventSerializer(serializers.ModelSerializer):
+  class Meta:
+    model = ApplicationEvent
+    fields = ['id', 'application', 'from_status', 'to_status', 'created_at']
+
+class EmployerApplicationEventSerializer(serializers.ModelSerializer):
+  class Meta:
+    model = ApplicationEvent
+    fields = ['id', 'application', 'from_status', 'to_status', 'note', 'created_at']
+
+# One applicant row as the employer's applications table renders it: the
+# application fields plus the same lean candidate brief the rest of the
+# employer UI uses, and the recommender score for the exact job they applied
+# to (passed via context as {(user_id, job_id): score} to stay query-flat).
+class ApplicantRowSerializer(serializers.ModelSerializer):
+  candidate = CandidateBriefSerializer(source='user', read_only=True)
+  score = serializers.SerializerMethodField()
+  total_experience_months = serializers.SerializerMethodField()
+
+  class Meta:
+    model = Application
+    fields = ['id', 'user', 'job', 'status', 'cover_letter', 'employer_viewed_at', 'created_at', 'updated_at', 'candidate', 'score', 'total_experience_months']
+
+  def get_score(self, obj):
+    return self.context.get('scores', {}).get((obj.user_id, obj.job_id))
+
+  def get_total_experience_months(self, obj):
+    # Sum of whole months across the candidate's roles (open roles count up to
+    # today) - the same math as the frontend's deriveStats, so the table's
+    # "(2 years 8 months)" agrees with the review modal's total. None (not 0)
+    # when they have no work history at all, so "no experience listed" is
+    # distinguishable from "less than a month". Callers MUST prefetch
+    # `user__work_experiences` - this scans the cached list, it does not query.
+    experiences = obj.user.work_experiences.all()
+    if not experiences:
+      return None
+    today = datetime.date.today()
+    total = 0
+    for we in experiences:
+      end = we.end_date or today
+      months = (end.year - we.start_date.year) * 12 + (end.month - we.start_date.month)
+      if months > 0:
+        total += months
+    return total
 
 class ApplicationQuestionSerializer(serializers.ModelSerializer):
   class Meta:

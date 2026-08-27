@@ -55,6 +55,7 @@ urlpatterns = [
     path("api/company/saved_candidates/", views.company_saved_candidates, name="company_saved_candidates"),
     path("api/company/saved_candidates/<int:id>/", views.company_saved_candidate_details, name="company_saved_candidate_details"),
     path("api/applications/", views.job_applications, name="applications"),
+    path("api/applications/<int:id>", views.application_detail, name="application_detail"),
     # Messaging. All four routes keep the trailing slash (the site-wide
     # convention; the slashless ones above are the legacy exceptions).
     path("api/conversations/", views.conversations, name="conversations"),
