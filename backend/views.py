@@ -18,7 +18,7 @@ from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSeria
 
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token
-from .emails import send_verification_email, send_password_reset_email
+from .emails import send_verification_email, send_password_reset_email, send_new_message_email
 
 # The only user fields registration accepts from a client. create_user passes
 # **kwargs straight onto the model, so an unfiltered body could set is_staff /
@@ -989,9 +989,40 @@ def _post_employer_message(job, candidate, actor, body):
   # automatic status-change and invite messages; callers hold the gate - they
   # own the job and the candidate was invited to it or applied.
   conversation, _ = Conversation.objects.get_or_create(job=job, candidate=candidate)
-  Message.objects.create(conversation=conversation, sender=actor, body=body)
+  message = Message.objects.create(conversation=conversation, sender=actor, body=body)
   _mark_read(conversation, 'employer')
+  _email_candidate_new_message(conversation, message)
   return conversation
+
+def _job_display_identity(job):
+  # Who the candidate is talking to, as (name, photo url or ''): the branch the
+  # job is posted under when it has one, else the company. Used for both the
+  # thread header and the email. A branch without its own photo borrows the
+  # company's, matching _conversation_counterpart.
+  if job.branch_id:
+    branch = job.branch
+    company_photo = job.company.photo if job.company is not None else ''
+    return branch.name, (branch.photo or company_photo or '')
+  if job.company is not None:
+    return job.company.name, (job.company.photo or '')
+  return 'The company', ''
+
+def _job_display_name(job):
+  return _job_display_identity(job)[0]
+
+def _email_candidate_new_message(conversation, message):
+  # Every employer-authored message is mirrored to the candidate by email
+  # (manual sends, invites, status changes). Callers must only invoke this for
+  # employer-sent messages - candidates never get emailed their own replies.
+  sender_name, sender_photo = _job_display_identity(conversation.job)
+  send_new_message_email(
+    candidate=conversation.candidate,
+    sender_name=sender_name,
+    sender_photo=sender_photo,
+    job_title=conversation.job.title,
+    conversation_id=conversation.id,
+    body=message.body,
+  )
 
 def _clean_message_body(raw):
   body = raw.strip() if isinstance(raw, str) else ''
@@ -1010,10 +1041,26 @@ def _conversation_counterpart(conversation, role):
   # never the employer user's personal identity; employers see the same lean
   # candidate subset as CandidateBriefSerializer (no email, no DOB).
   if role == 'candidate':
-    company = conversation.job.company
+    job = conversation.job
+    company = job.company
     if company is None:
-      return {'id': None, 'name': 'Company', 'photo': None, 'subtitle': None}
-    return {'id': company.id, 'name': company.name, 'photo': company.photo, 'subtitle': company.city}
+      return {'id': None, 'name': 'Company', 'photo': None, 'subtitle': None, 'company_name': None}
+    # A job posted under a branch is presented as that branch (name, photo,
+    # city); `id`/`company_name` stay the company's so the frontend can still
+    # link to "all jobs by this company".
+    if job.branch_id:
+      branch = job.branch
+      return {
+        'id': company.id,
+        'name': branch.name,
+        'photo': branch.photo or company.photo,
+        'subtitle': branch.city,
+        'company_name': company.name,
+      }
+    return {
+      'id': company.id, 'name': company.name, 'photo': company.photo, 'subtitle': company.city,
+      'company_name': company.name,
+    }
   candidate = conversation.candidate
   return {
     'id': candidate.id,
@@ -1068,7 +1115,7 @@ def _unread_by_conversation(user, conversations):
 @throttle_classes([PostScopedRateThrottle])
 def conversations(request, format=None):
   if request.method == 'GET':
-    convs = list(_member_conversations(request.user).select_related('job__company', 'candidate'))
+    convs = list(_member_conversations(request.user).select_related('job__company', 'job__branch', 'candidate'))
     conv_ids = [c.id for c in convs]
 
     # Latest message per thread in two flat queries (ids, then rows), plus two
@@ -1129,8 +1176,12 @@ def conversations(request, format=None):
       # Idempotent: a second "Message" tap appends to the existing thread (the
       # unique constraint makes the get_or_create race safe).
       conversation, created = Conversation.objects.get_or_create(job=job, candidate_id=candidate_id)
-      Message.objects.create(conversation=conversation, sender=request.user, body=body)
+      message = Message.objects.create(conversation=conversation, sender=request.user, body=body)
       _mark_read(conversation, 'employer')
+
+    # After the transaction on purpose: the email is best-effort and must not
+    # hold the write open or be sent for a row that then rolls back.
+    _email_candidate_new_message(conversation, message)
 
     return Response(
       _thread_payload(conversation, request.user, 'employer'),
@@ -1143,7 +1194,7 @@ conversations.cls.throttle_scope = 'messages'
 @permission_classes([IsAuthenticated])
 def conversation_details(request, id, format=None):
   try:
-    conversation = _member_conversations(request.user).select_related('job__company', 'candidate').get(pk=id)
+    conversation = _member_conversations(request.user).select_related('job__company', 'job__branch', 'candidate').get(pk=id)
   except Conversation.DoesNotExist:
     return Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -1175,7 +1226,7 @@ def conversation_messages(request, id, format=None):
   # exists if the gate passed at creation, and being its candidate means an
   # employer has already messaged you (threads are born with a message).
   try:
-    conversation = _member_conversations(request.user).select_related('job__company', 'candidate').get(pk=id)
+    conversation = _member_conversations(request.user).select_related('job__company', 'job__branch', 'candidate').get(pk=id)
   except Conversation.DoesNotExist:
     return Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -1183,8 +1234,11 @@ def conversation_messages(request, id, format=None):
   if error:
     return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
 
+  role = _conversation_role(conversation, request.user)
   message = Message.objects.create(conversation=conversation, sender=request.user, body=body)
-  _mark_read(conversation, _conversation_role(conversation, request.user))
+  _mark_read(conversation, role)
+  if role == 'employer':
+    _email_candidate_new_message(conversation, message)
 
   return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
 

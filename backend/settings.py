@@ -45,8 +45,14 @@ AWS_SES_REGION_NAME = env('AWS_SES_REGION_NAME', default=AWS_S3_REGION_NAME)
 AWS_SES_REGION_ENDPOINT = f'email.{AWS_SES_REGION_NAME}.amazonaws.com'
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='Recommender <noreply@recapp.example>')
 
-# Base URL of the Next.js frontend, used to build links inside emails.
+# Base URL of the Next.js frontend, used to build links inside emails
+# (verify-email, password reset, and the /candidate/messages/<id> link in
+# new-message notifications).
 FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
+
+# Public name of the product, used in email subjects/bodies and the email
+# template's wordmark. Change it in .env to rebrand every email at once.
+WEBSITE_NAME = env('WEBSITE_NAME', default='Recommender App')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True

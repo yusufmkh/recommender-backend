@@ -1,0 +1,108 @@
+{# Shared transactional email layout. Table-based + inline styles on purpose: #}
+{# Gmail/Outlook strip <style> blocks and ignore flex/grid. Context: #}
+{#   preheader   - hidden one-liner shown next to the subject in inbox lists #}
+{#   greeting    - "Hi Sam," #}
+{#   intro       - list of paragraphs above the quote/CTA #}
+{#   quote       - optional {label, photo, initial, body, meta}: a message box #}
+{#                 headed by the sender's photo (or initial) + name #}
+{#   cta         - optional {label, url} #}
+{#   outro       - list of paragraphs below the CTA #}
+{#   footer_note - small print at the bottom (why you got this) #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="light">
+  <title>{{ subject }}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;-webkit-text-size-adjust:100%;">
+  {% if preheader %}
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#f3f4f6;font-size:1px;line-height:1px;">{{ preheader }}&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
+  {% endif %}
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f3f4f6;">
+    <tr>
+      <td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
+
+          <!-- Wordmark -->
+          <tr>
+            <td style="padding:0 8px 20px 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+              <a href="{{ frontend_url }}" style="text-decoration:none;color:#44546A;font-size:24px;font-weight:700;font-style:italic;letter-spacing:-0.01em;">{{ website_name }}</a>
+            </td>
+          </tr>
+
+          <!-- Card -->
+          <tr>
+            <td style="background-color:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px 32px 28px 32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#18181b;font-size:16px;line-height:1.55;">
+              <p style="margin:0 0 16px 0;">{{ greeting }}</p>
+
+              {% for paragraph in intro %}
+              <p style="margin:0 0 16px 0;">{{ paragraph }}</p>
+              {% endfor %}
+
+              {% if quote %}
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:4px 0 24px 0;">
+                <tr>
+                  <td style="background-color:#f8f9fb;border-left:4px solid #44546A;border-radius:0 8px 8px 0;padding:16px 18px;">
+                    {% if quote.label %}
+                    <!-- Sender header: photo (or initial) + name -->
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 12px 0;">
+                      <tr>
+                        <td valign="middle" style="padding:0 12px 0 0;">
+                          {% if quote.photo %}
+                          <img src="{{ quote.photo }}" width="40" height="40" alt="" style="display:block;width:40px;height:40px;border-radius:20px;object-fit:cover;background-color:#e4e4e7;">
+                          {% else %}
+                          <div style="width:40px;height:40px;line-height:40px;border-radius:20px;background-color:#44546A;color:#ffffff;font-size:16px;font-weight:600;text-align:center;">{{ quote.initial }}</div>
+                          {% endif %}
+                        </td>
+                        <td valign="middle" style="font-size:15px;font-weight:600;color:#18181b;line-height:1.3;">
+                          {{ quote.label }}
+                          {% if quote.meta %}<br><span style="font-size:13px;font-weight:400;color:#71717a;">{{ quote.meta }}</span>{% endif %}
+                        </td>
+                      </tr>
+                    </table>
+                    {% endif %}
+                    <p style="margin:0;white-space:pre-wrap;word-break:break-word;color:#27272a;">{{ quote.body }}</p>
+                  </td>
+                </tr>
+              </table>
+              {% endif %}
+
+              {% if cta %}
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:4px 0 24px 0;">
+                <tr>
+                  <td align="center" style="background-color:#44546A;border-radius:8px;">
+                    <a href="{{ cta.url }}" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:8px;">{{ cta.label }}</a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:0 0 16px 0;font-size:13px;line-height:1.5;color:#71717a;">
+                If the button doesn't work, copy this link into your browser:<br>
+                <a href="{{ cta.url }}" style="color:#44546A;word-break:break-all;">{{ cta.url }}</a>
+              </p>
+              {% endif %}
+
+              {% for paragraph in outro %}
+              <p style="margin:0 0 16px 0;">{{ paragraph }}</p>
+              {% endfor %}
+
+              <p style="margin:8px 0 0 0;">— The {{ website_name }} team</p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:20px 8px 0 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:1.5;color:#a1a1aa;">
+              {% if footer_note %}<p style="margin:0 0 6px 0;">{{ footer_note }}</p>{% endif %}
+              <p style="margin:0;">{{ website_name }} · Hospitality jobs in London · <a href="{{ frontend_url }}" style="color:#a1a1aa;">{{ frontend_host }}</a></p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -1,13 +1,16 @@
 import datetime
+from unittest import mock
 
+from django.core import mail
 from django.core.cache import cache
 from django.db import connection
+from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
 
-from .models import MyUser, Company, Job, Match, Application, ApplicationEvent, SavedCandidate, WorkExperience, Conversation, Message
+from .models import MyUser, Company, CompanyBranch, Job, Match, Application, ApplicationEvent, SavedCandidate, WorkExperience, Conversation, Message
 from .serializers import MyUserSerializer
 
 class CandidateTests(APITestCase):
@@ -542,6 +545,10 @@ class ApplicationTests(APITestCase):
     self.assertEqual(len(messages), 1)
     self.assertEqual(messages[0].sender, self.employer)
     self.assertEqual(messages[0].body, 'Good news — your application for Chef has been shortlisted.')
+    # The candidate is emailed the same text; the employer's internal note never is.
+    self.assertEqual(len(mail.outbox), 1)
+    self.assertEqual(mail.outbox[0].to, [self.candidate.email])
+    self.assertIn(messages[0].body, mail.outbox[0].body)
     # The candidate's badge lights up; the employer's own message never counts for them.
     self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 1})
     self.assertEqual(self._unread(self.employer), {'unread_conversations': 0, 'unread_messages': 0})
@@ -671,6 +678,10 @@ class InviteTests(APITestCase):
     )
     self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 1})
     self.assertEqual(self._unread(self.employer), {'unread_conversations': 0, 'unread_messages': 0})
+    # ...and the same message lands in their email inbox.
+    self.assertEqual(len(mail.outbox), 1)
+    self.assertEqual(mail.outbox[0].to, [self.candidate.email])
+    self.assertIn(messages[0].body, mail.outbox[0].body)
 
     # Candidates see the company as the counterpart, never the employer user.
     self.client.force_authenticate(user=self.candidate)
@@ -967,6 +978,80 @@ class MessagingTests(APITestCase):
       self._inbox()
 
     self.assertEqual(len(baseline.captured_queries), len(grown.captured_queries))
+
+  # --- email notifications ---
+
+  @override_settings(FRONTEND_URL='http://testserver')
+  def test_opening_a_thread_emails_the_candidate(self):
+    response = self._start(self.invited, self.job_a, body='Fancy a chat?')
+
+    self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+    conversation_id = response.data['conversation']['id']
+    self.assertEqual(len(mail.outbox), 1)
+    email = mail.outbox[0]
+    self.assertEqual(email.to, [self.invited.email])
+    self.assertEqual(email.subject, 'New message from alpha Ltd about Chef')
+    self.assertIn('Hi invited,', email.body)
+    self.assertIn('alpha Ltd sent you a message about Chef:', email.body)
+    self.assertIn('Fancy a chat?', email.body)
+    self.assertIn(f'http://testserver/candidate/messages/{conversation_id}', email.body)
+
+  def test_employer_reply_emails_the_candidate_but_candidate_reply_does_not(self):
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+    self.assertEqual(len(mail.outbox), 1)
+
+    self.assertEqual(self._send(conversation_id, body='Still keen?').status_code, status.HTTP_201_CREATED)
+    self.assertEqual(len(mail.outbox), 2)
+    self.assertEqual(mail.outbox[1].to, [self.invited.email])
+    self.assertIn('Still keen?', mail.outbox[1].body)
+
+    self.client.force_authenticate(user=self.invited)
+    self.assertEqual(self._send(conversation_id, body='Yes!').status_code, status.HTTP_201_CREATED)
+    # The candidate is the sender: nobody gets emailed their own reply, and the
+    # employer side has no email notifications at all.
+    self.assertEqual(len(mail.outbox), 2)
+
+  def test_branch_name_is_used_when_the_job_has_a_branch(self):
+    branch = CompanyBranch.objects.create(
+      company=self.company_a, name='alpha Soho', photo='https://img/soho.png',
+      address='2 Street', postcode='W1', city='Soho', state='London', country='UK',
+    )
+    self.job_a.branch = branch
+    self.job_a.save(update_fields=['branch'])
+
+    conversation_id = self._start(self.invited, self.job_a).data['conversation']['id']
+
+    self.assertEqual(mail.outbox[0].subject, 'New message from alpha Soho about Chef')
+    self.assertIn('alpha Soho sent you a message about Chef:', mail.outbox[0].body)
+
+    # The candidate's view of the thread and inbox is the branch too - but the
+    # company id/name travel alongside so "all jobs by this company" still works.
+    self.client.force_authenticate(user=self.invited)
+    counterpart = self._thread(conversation_id).data['conversation']['counterpart']
+    self.assertEqual(counterpart, {
+      'id': self.company_a.id, 'name': 'alpha Soho', 'photo': 'https://img/soho.png',
+      'subtitle': 'Soho', 'company_name': 'alpha Ltd',
+    })
+    inbox = self._inbox().data['conversations']
+    self.assertEqual(inbox[0]['counterpart']['name'], 'alpha Soho')
+
+    # A job without a branch keeps showing the company.
+    self.client.force_authenticate(user=self.employer_a)
+    Match.objects.create(user=self.invited, job=self.job_a2, is_invited=True, score=50)
+    other_id = self._start(self.invited, self.job_a2).data['conversation']['id']
+    self.assertEqual(mail.outbox[1].subject, 'New message from alpha Ltd about Waiter')
+    self.client.force_authenticate(user=self.invited)
+    counterpart = self._thread(other_id).data['conversation']['counterpart']
+    self.assertEqual(counterpart['name'], 'alpha Ltd')
+    self.assertEqual(counterpart['company_name'], 'alpha Ltd')
+
+  def test_email_failure_does_not_break_the_send(self):
+    with mock.patch('backend.emails.EmailMultiAlternatives.send', side_effect=RuntimeError('SES down')):
+      with self.assertLogs('backend.emails', level='ERROR'):
+        response = self._start(self.invited, self.job_a, body='Hello?')
+
+    self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+    self.assertEqual(Message.objects.filter(conversation_id=response.data['conversation']['id']).count(), 1)
 
   # --- throttling ---
 
