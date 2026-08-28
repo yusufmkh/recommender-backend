@@ -50,20 +50,28 @@ def _company_candidates(company):
   matches = Match.objects.filter(job__in=company_jobs)
   saved = SavedCandidate.objects.filter(company=company)
 
+  # Mirrors the candidate deck: once a candidate has applied to a job - in ANY
+  # status, withdrawn included - that (candidate, job) pair is an application,
+  # not a match, and the employer finds them under Applications instead. One
+  # flat query, so the dashboard stays query-flat however many applicants.
+  applied = set(Application.objects.filter(job__in=company_jobs).values_list('user_id', 'job_id'))
+  visible = [m for m in matches if (m.user_id, m.job_id) not in applied]
+
   # Union the ids first so an overlapping candidate is fetched once, and their
   # work experiences prefetched once, rather than once per queryset. Neither
   # queryset needs select_related('user') as a result.
-  user_ids = {m.user_id for m in matches} | {s.user_id for s in saved}
+  user_ids = {m.user_id for m in visible} | {s.user_id for s in saved}
   users_by_id = {u.id: u for u in MyUser.objects.filter(pk__in=user_ids).prefetch_related('work_experiences')}
 
   rows = {uid: {'user': users_by_id[uid], 'matches': [], 'saved': None} for uid in user_ids}
-  for match in matches:
+  for match in visible:
     rows[match.user_id]['matches'].append(match)
   for saved_candidate in saved:
     # A shortlisted candidate stays listed even once their matches are gone.
     rows[saved_candidate.user_id]['saved'] = saved_candidate
 
-  return company_jobs, matches, rows
+  # `matches` is unfiltered on purpose: applicant rows still need their score.
+  return company_jobs, matches, visible, rows
 
 def _company_can_view_candidate(employer, candidate_id):
   # An employer may see a candidate matched to, applied to, or shortlisted by
@@ -476,7 +484,7 @@ def company_dashboard(request, format=None):
   except Company.DoesNotExist:
     # A candidate token landing here is "not an employer", not a server error.
     return Response(status=status.HTTP_403_FORBIDDEN)
-  company_jobs, all_matches, rows = _company_candidates(company_info)
+  company_jobs, all_matches, visible_matches, rows = _company_candidates(company_info)
   # work_experiences feed ApplicantRowSerializer.total_experience_months -
   # prefetched so the applicant list stays query-flat however long it gets.
   job_applicants = Application.objects.filter(job__in=company_jobs).select_related('user').prefetch_related('user__work_experiences')
@@ -510,8 +518,9 @@ def company_dashboard(request, format=None):
       'saved_candidates': CompanyCandidateSerializer(shortlisted, many=True).data,
       # Filtered from the rows already in memory - no second query, and always
       # consistent with candidate_matches. Invites are deliberately NOT filtered
-      # by shortlist status: the two axes are independent.
-      'candidate_invites': MatchSerializer([m for m in all_matches if m.is_invited], many=True).data,
+      # by shortlist status: the two axes are independent. An invited match the
+      # candidate has since applied to is an applicant, not an open invite.
+      'candidate_invites': MatchSerializer([m for m in visible_matches if m.is_invited], many=True).data,
     }
   )
 

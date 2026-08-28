@@ -123,6 +123,36 @@ class EmployerShortlistTests(APITestCase):
   def _user_ids(self, rows):
     return {row['user']['id'] for row in rows}
 
+  def test_applied_candidate_leaves_candidate_matches(self):
+    Application.objects.create(user=self.matched, job=self.job_a)
+    dashboard = self._dashboard()
+    self.assertNotIn(self.matched.id, self._user_ids(dashboard['candidate_matches']))
+    self.assertIn(self.other.id, self._user_ids(dashboard['candidate_matches']))
+    # They only applied at company A - still an open match for company B.
+    self.assertIn(self.matched.id, self._user_ids(self._dashboard(self.employer_b)['candidate_matches']))
+
+  def test_withdrawn_application_still_hides_the_match(self):
+    Application.objects.create(user=self.matched, job=self.job_a, status='w')
+    self.assertNotIn(self.matched.id, self._user_ids(self._dashboard()['candidate_matches']))
+
+  def test_applied_job_is_dropped_from_a_saved_candidates_matches(self):
+    job_2 = Job.objects.create(company=self.company_a, title='Waiter', description='Serve')
+    Match.objects.create(user=self.matched, job=job_2, score=40)
+    self._save(self.matched)
+    Application.objects.create(user=self.matched, job=self.job_a)
+    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == self.matched.id)
+    self.assertEqual([m['job'] for m in row['matches']], [job_2.id])
+    self.assertEqual(row['top_score'], 40)
+
+  def test_applied_match_is_not_an_open_invite(self):
+    self.match.is_invited = True
+    self.match.save()
+    Application.objects.create(user=self.matched, job=self.job_a)
+    dashboard = self._dashboard()
+    self.assertNotIn(self.match.id, {invite['id'] for invite in dashboard['candidate_invites']})
+    # The applicant row still carries the recommender score for that job.
+    self.assertEqual(dashboard['job_applicants'][0]['score'], 90)
+
   def test_saving_moves_candidate_to_the_shortlist(self):
     before = self._dashboard()
     self.assertIn(self.matched.id, self._user_ids(before['candidate_matches']))
