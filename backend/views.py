@@ -2,6 +2,8 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Max, Q
 from django.contrib.auth.tokens import default_token_generator
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
@@ -11,14 +13,15 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework import serializers, status
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
 
 from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, Preference, SavedJob, SavedCandidate, Match, Application, ApplicationEvent, ApplicationQuestion, ApplicationAnswer, AttachmentRequirement, AttachmentAnswer, Conversation, Message
 
 from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, CandidateBriefSerializer, ApplicationSerializer, ApplicationEventSerializer, EmployerApplicationEventSerializer, ApplicantRowSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, MessageSerializer
 
 from .s3_utils import generate_presigned_post, delete_object
-from .tokens import email_verification_token
-from .emails import send_verification_email, send_password_reset_email, send_new_message_email
+from .tokens import email_verification_token, email_change_token
+from .emails import send_verification_email, send_password_reset_email, send_new_message_email, send_email_change_email
 
 # The only user fields registration accepts from a client. create_user passes
 # **kwargs straight onto the model, so an unfiltered body could set is_staff /
@@ -191,8 +194,9 @@ def password_reset_confirm(request):
   if not user or not token or not default_token_generator.check_token(user, token):
     return Response({'error': 'This reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
-  if not new_password or len(new_password) < 8:
-    return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+  error = _password_error(new_password, user)
+  if error:
+    return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
 
   user.set_password(new_password)
   user.save()
@@ -225,6 +229,95 @@ def email_verify_resend(request):
   return Response({'ok': True})
 
 email_verify_resend.cls.throttle_scope = 'email_verify'
+
+def _password_error(password, user):
+  # One message string for the form, from Django's configured validators
+  # (length, common, numeric, similarity to the user's own details).
+  if not password:
+    return 'Password is required.'
+  try:
+    validate_password(password, user)
+  except DjangoValidationError as exc:
+    return ' '.join(exc.messages)
+  return None
+
+def _revoke_refresh_tokens(user):
+  # Every outstanding refresh token is blacklisted, so other sessions can't
+  # mint new access tokens after a password change. Already-issued ACCESS
+  # tokens are signature-checked only and keep working until they expire.
+  for token in OutstandingToken.objects.filter(user=user):
+    BlacklistedToken.objects.get_or_create(token=token)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def account_password(request):
+  user = MyUser.objects.get(pk=request.user.id)
+  if not user.check_password(request.data.get('current_password') or ''):
+    return Response({'error': 'Your current password is incorrect.', 'field': 'current_password'}, status=status.HTTP_400_BAD_REQUEST)
+
+  new_password = request.data.get('new_password') or ''
+  error = _password_error(new_password, user)
+  if error:
+    return Response({'error': error, 'field': 'new_password'}, status=status.HTTP_400_BAD_REQUEST)
+
+  user.set_password(new_password)
+  user.save(update_fields=['password'])
+  _revoke_refresh_tokens(user)
+  return Response({'ok': True})
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ScopedRateThrottle])
+def account_email_request(request):
+  # Step 1 of a verified email change: park the new address on pending_email
+  # and mail a confirmation link to IT. Nothing about the account changes until
+  # account_email_confirm; the current address keeps working for sign-in.
+  user = MyUser.objects.get(pk=request.user.id)
+  if not user.check_password(request.data.get('current_password') or ''):
+    return Response({'error': 'Your current password is incorrect.', 'field': 'current_password'}, status=status.HTTP_400_BAD_REQUEST)
+
+  new_email = MyUser.objects.normalize_email((request.data.get('new_email') or '').strip())
+  try:
+    serializers.EmailField().run_validation(new_email)
+  except serializers.ValidationError:
+    return Response({'error': 'Enter a valid email address.', 'field': 'new_email'}, status=status.HTTP_400_BAD_REQUEST)
+  if new_email.lower() == user.email.lower():
+    return Response({'error': 'That is already your email address.', 'field': 'new_email'}, status=status.HTTP_400_BAD_REQUEST)
+  if MyUser.objects.filter(email__iexact=new_email).exclude(pk=user.pk).exists():
+    return Response({'error': 'That email address is already in use.', 'field': 'new_email'}, status=status.HTTP_400_BAD_REQUEST)
+
+  user.pending_email = new_email
+  user.save(update_fields=['pending_email'])
+  send_email_change_email(user)
+  return Response({'ok': True, 'pending_email': user.pending_email})
+
+account_email_request.cls.throttle_scope = 'email_verify'
+
+@api_view(['POST'])
+def account_email_confirm(request):
+  # Unauthenticated on purpose: the link may be opened on another device.
+  user = _user_from_uid(request.data.get('uid'))
+  token = request.data.get('token')
+
+  if not user or not user.pending_email or not token or not email_change_token.check_token(user, token):
+    return Response({'error': 'This confirmation link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  # Someone may have registered the address between request and click.
+  if MyUser.objects.filter(email__iexact=user.pending_email).exclude(pk=user.pk).exists():
+    user.pending_email = ''
+    user.save(update_fields=['pending_email'])
+    return Response({'error': 'That email address is now in use by another account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+  user.email = user.pending_email
+  user.pending_email = ''
+  user.save(update_fields=['email', 'pending_email'])
+  return Response({'ok': True, 'email': user.email})
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def account_email_cancel(request):
+  MyUser.objects.filter(pk=request.user.id).update(pending_email='')
+  return Response({'ok': True})
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1014,6 +1107,10 @@ def _email_candidate_new_message(conversation, message):
   # Every employer-authored message is mirrored to the candidate by email
   # (manual sends, invites, status changes). Callers must only invoke this for
   # employer-sent messages - candidates never get emailed their own replies.
+  # The candidate's opt-out lives here so every path (manual send, invite,
+  # status change) honours it; the in-app message is still created.
+  if not conversation.candidate.email_notifications:
+    return
   sender_name, sender_photo = _job_display_identity(conversation.job)
   send_new_message_email(
     candidate=conversation.candidate,

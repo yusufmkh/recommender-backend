@@ -8,7 +8,7 @@ from django.template.loader import render_to_string
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 
-from .tokens import email_verification_token
+from .tokens import email_verification_token, email_change_token
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ def send_password_reset_email(user):
       f'Hi {user.first_name},\n\n'
       f'We received a request to reset your password. Click the link below to choose a new one:\n\n'
       f'{link}\n\n'
+      f'This link expires in 1 hour.\n\n'
       f"If you didn't request this, you can safely ignore this email."
     ),
     html_context={
@@ -79,7 +80,37 @@ def send_password_reset_email(user):
       'intro': ['We received a request to reset your password. Use the button below to choose a new one.'],
       'cta': {'label': 'Reset password', 'url': link},
       'outro': [],
+      'note': 'This link expires in 1 hour. After that, request a new one from the sign-in page.',
       'footer_note': "If you didn't request a password reset, you can safely ignore this email - your password won't change.",
+    },
+  )
+
+
+def send_email_change_email(user):
+  # Sent to the NEW address (user.pending_email); the current address is
+  # untouched until the link is clicked.
+  uid = _uid(user)
+  token = email_change_token.make_token(user)
+  link = f'{settings.FRONTEND_URL}/confirm-email-change?uid={uid}&token={token}'
+
+  _send(
+    subject=f'Confirm your new {settings.WEBSITE_NAME} email address',
+    to=user.pending_email,
+    text=(
+      f'Hi {user.first_name},\n\n'
+      f'You asked to change your {settings.WEBSITE_NAME} email address to this one. Click the link below to confirm:\n\n'
+      f'{link}\n\n'
+      f'This link expires in 1 hour.\n\n'
+      f"If you didn't request this, you can ignore this email - your address won't change."
+    ),
+    html_context={
+      'preheader': f'Confirm this as your new {settings.WEBSITE_NAME} email address.',
+      'greeting': f'Hi {user.first_name},',
+      'intro': [f'You asked to change your {settings.WEBSITE_NAME} email address to this one. Confirm it below and you will sign in with this address from then on.'],
+      'cta': {'label': 'Confirm new email', 'url': link},
+      'outro': [],
+      'note': 'This link expires in 1 hour. After that, request a new one from Settings.',
+      'footer_note': "If you didn't request this change, you can ignore this email - your address won't change.",
     },
   )
 
@@ -93,6 +124,9 @@ def send_new_message_email(candidate, sender_name, job_title, conversation_id, b
   # failures are logged and swallowed - unlike the verification/reset emails,
   # the in-app thread is the source of truth and the badge still lights up.
   link = f'{settings.FRONTEND_URL}/candidate/messages/{conversation_id}'
+  # Footer opt-out goes to the notifications section of Settings (signed-in;
+  # the sign-in page bounces back via ?next=).
+  unsubscribe_url = f'{settings.FRONTEND_URL}/candidate/settings#email-notifications'
   try:
     _send(
       subject=f'New message from {sender_name} about {job_title}',
@@ -101,7 +135,8 @@ def send_new_message_email(candidate, sender_name, job_title, conversation_id, b
         f'Hi {candidate.first_name},\n\n'
         f'{sender_name} sent you a message about {job_title}:\n\n'
         f'{body}\n\n'
-        f'Reply here: {link}\n'
+        f'Reply here: {link}\n\n'
+        f'Unsubscribe from message emails: {unsubscribe_url}\n'
       ),
       html_context={
         'preheader': body[:120],
@@ -119,6 +154,7 @@ def send_new_message_email(candidate, sender_name, job_title, conversation_id, b
         'cta': {'label': f'Reply on {settings.WEBSITE_NAME}', 'url': link},
         'outro': [],
         'footer_note': f"You're receiving this because an employer messaged you on {settings.WEBSITE_NAME}. Replies to this email aren't monitored - use the button above to respond.",
+        'unsubscribe_url': unsubscribe_url,
       },
     )
   except Exception:

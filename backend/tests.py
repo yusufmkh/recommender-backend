@@ -1072,3 +1072,176 @@ class MessagingTests(APITestCase):
     finally:
       PostScopedRateThrottle.THROTTLE_RATES = original_rates
       cache.clear()
+
+
+class AccountSettingsTests(APITestCase):
+  """The candidate Settings page: password change (revokes refresh tokens),
+  verified email change (pending_email + emailed link), and the single
+  email-notifications opt-out that gates every message-mirroring email."""
+
+  def setUp(self):
+    self.candidate = MyUser.objects.create_user(
+      email='sam@test.com', user_name='sam', first_name='Sam', last_name='Lee',
+      password='orig-pass-123', is_active=True,
+    )
+    # account_email_request shares the throttled `email_verify` scope (5/hour)
+    # and the counter lives in the cache, which outlives a test's transaction.
+    cache.clear()
+    self.client.force_authenticate(user=self.candidate)
+
+  def _login(self, email, password):
+    return APIClient().post(reverse('token_obtain_pair'), {'email': email, 'password': password}, format='json')
+
+  # --- password ---
+
+  def test_wrong_current_password_is_rejected(self):
+    response = self.client.post(reverse('account_password'), {'current_password': 'nope', 'new_password': 'brand-new-pass-9'}, format='json')
+    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(response.data['field'], 'current_password')
+    self.assertTrue(MyUser.objects.get(pk=self.candidate.pk).check_password('orig-pass-123'))
+
+  def test_weak_new_password_is_rejected(self):
+    response = self.client.post(reverse('account_password'), {'current_password': 'orig-pass-123', 'new_password': '12345678'}, format='json')
+    self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(response.data['field'], 'new_password')
+
+  def test_password_change_works_and_revokes_refresh_tokens(self):
+    refresh = self._login('sam@test.com', 'orig-pass-123').data['refresh']
+
+    response = self.client.post(reverse('account_password'), {'current_password': 'orig-pass-123', 'new_password': 'brand-new-pass-9'}, format='json')
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertEqual(self._login('sam@test.com', 'orig-pass-123').status_code, status.HTTP_401_UNAUTHORIZED)
+    self.assertEqual(self._login('sam@test.com', 'brand-new-pass-9').status_code, status.HTTP_200_OK)
+    # The pre-change refresh token can no longer mint access tokens.
+    self.assertEqual(APIClient().post(reverse('token_refresh'), {'refresh': refresh}, format='json').status_code, status.HTTP_401_UNAUTHORIZED)
+
+  # --- email change ---
+
+  def _request_change(self, new_email='new@test.com', password='orig-pass-123'):
+    return self.client.post(reverse('account_email_request'), {'new_email': new_email, 'current_password': password}, format='json')
+
+  def _link_params(self):
+    body = mail.outbox[-1].body
+    query = body.split('/confirm-email-change?', 1)[1].split()[0]
+    return dict(part.split('=', 1) for part in query.split('&'))
+
+  @override_settings(FRONTEND_URL='http://testserver')
+  def test_request_parks_pending_email_and_mails_the_new_address(self):
+    response = self._request_change('New@Test.com')
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    user = MyUser.objects.get(pk=self.candidate.pk)
+    self.assertEqual(user.email, 'sam@test.com')
+    self.assertEqual(user.pending_email, 'New@test.com')
+    self.assertEqual(len(mail.outbox), 1)
+    self.assertEqual(mail.outbox[0].to, ['New@test.com'])
+    self.assertIn('http://testserver/confirm-email-change?uid=', mail.outbox[0].body)
+
+  def test_request_rejects_wrong_password_taken_and_unchanged_addresses(self):
+    MyUser.objects.create_user(email='taken@test.com', user_name='taken', first_name='T', last_name='K', password='pw12345678', is_active=True)
+    self.assertEqual(self._request_change(password='nope').data['field'], 'current_password')
+    self.assertEqual(self._request_change('TAKEN@test.com').data['field'], 'new_email')
+    self.assertEqual(self._request_change('sam@test.com').data['field'], 'new_email')
+    self.assertEqual(self._request_change('not-an-email').data['field'], 'new_email')
+    self.assertEqual(len(mail.outbox), 0)
+    self.assertEqual(MyUser.objects.get(pk=self.candidate.pk).pending_email, '')
+
+  def test_confirm_swaps_the_address_and_login_follows(self):
+    self._request_change()
+    params = self._link_params()
+
+    response = APIClient().post(reverse('account_email_confirm'), params, format='json')
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    user = MyUser.objects.get(pk=self.candidate.pk)
+    self.assertEqual(user.email, 'new@test.com')
+    self.assertEqual(user.pending_email, '')
+    self.assertEqual(self._login('new@test.com', 'orig-pass-123').status_code, status.HTTP_200_OK)
+    self.assertEqual(self._login('sam@test.com', 'orig-pass-123').status_code, status.HTTP_401_UNAUTHORIZED)
+    # The link is single-use.
+    self.assertEqual(APIClient().post(reverse('account_email_confirm'), params, format='json').status_code, status.HTTP_400_BAD_REQUEST)
+
+  def test_cancel_and_bad_tokens_invalidate_the_link(self):
+    self._request_change()
+    params = self._link_params()
+    bad = dict(params, token='x' + params['token'][1:])
+    self.assertEqual(APIClient().post(reverse('account_email_confirm'), bad, format='json').status_code, status.HTTP_400_BAD_REQUEST)
+
+    self.assertEqual(self.client.post(reverse('account_email_cancel')).status_code, status.HTTP_200_OK)
+    self.assertEqual(APIClient().post(reverse('account_email_confirm'), params, format='json').status_code, status.HTTP_400_BAD_REQUEST)
+    self.assertEqual(MyUser.objects.get(pk=self.candidate.pk).email, 'sam@test.com')
+
+  def test_link_lifetimes(self):
+    # Reset + email-change links live 1 hour (PASSWORD_RESET_TIMEOUT);
+    # sign-up verification links keep their own 3-day window.
+    from django.contrib.auth.tokens import default_token_generator
+    from .tokens import email_change_token, email_verification_token
+
+    self.candidate.pending_email = 'new@test.com'
+    self.candidate.save(update_fields=['pending_email'])
+    reset = default_token_generator.make_token(self.candidate)
+    change = email_change_token.make_token(self.candidate)
+    verify = email_verification_token.make_token(self.candidate)
+
+    two_hours = datetime.datetime.now() + datetime.timedelta(hours=2)
+    with mock.patch.object(type(default_token_generator), '_now', return_value=two_hours):
+      self.assertFalse(default_token_generator.check_token(self.candidate, reset))
+      self.assertFalse(email_change_token.check_token(self.candidate, change))
+      self.assertTrue(email_verification_token.check_token(self.candidate, verify))
+
+    four_days = datetime.datetime.now() + datetime.timedelta(days=4)
+    with mock.patch.object(type(default_token_generator), '_now', return_value=four_days):
+      self.assertFalse(email_verification_token.check_token(self.candidate, verify))
+
+  def test_emails_mention_the_one_hour_expiry(self):
+    self._request_change()
+    self.assertIn('expires in 1 hour', mail.outbox[-1].body)
+    APIClient().post(reverse('password_reset_request'), {'email': 'sam@test.com'}, format='json')
+    self.assertIn('expires in 1 hour', mail.outbox[-1].body)
+
+  @override_settings(FRONTEND_URL='http://testserver')
+  def test_message_emails_link_to_the_notification_settings(self):
+    employer = MyUser.objects.create_user(email='emp2@test.com', user_name='emp2', first_name='E', last_name='R', password='pw12345678', is_active=True)
+    company = Company.objects.create(user=employer, name='Beta Ltd', email='emp2@test.com', phone_number='0', address='1 Road', postcode='E1', city='London', state='London', country='UK')
+    job = Job.objects.create(company=company, title='Chef', description='Cook')
+    Match.objects.create(user=self.candidate, job=job, is_invited=True, score=80)
+    self.client.force_authenticate(user=employer)
+    self.client.post(reverse('conversations'), {'candidate': self.candidate.id, 'job': job.id, 'body': 'Hello'}, format='json')
+
+    self.assertIn('Unsubscribe from message emails: http://testserver/candidate/settings#email-notifications', mail.outbox[0].body)
+    html = mail.outbox[0].alternatives[0][0]
+    self.assertIn('href="http://testserver/candidate/settings#email-notifications"', html)
+    self.assertIn('Unsubscribe from message emails', html)
+
+  def test_email_is_read_only_on_the_profile_endpoint(self):
+    response = self.client.patch(reverse('user_profile'), {'email': 'sneaky@test.com', 'user_name': 'sam2'}, format='json')
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    user = MyUser.objects.get(pk=self.candidate.pk)
+    self.assertEqual(user.email, 'sam@test.com')
+    self.assertEqual(user.user_name, 'sam2')
+
+  # --- notifications opt-out ---
+
+  def test_opting_out_stops_message_emails_but_not_messages(self):
+    employer = MyUser.objects.create_user(email='emp@test.com', user_name='emp', first_name='E', last_name='R', password='pw12345678', is_active=True)
+    company = Company.objects.create(user=employer, name='Alpha Ltd', email='emp@test.com', phone_number='0', address='1 Road', postcode='E1', city='London', state='London', country='UK')
+    job = Job.objects.create(company=company, title='Chef', description='Cook')
+    Match.objects.create(user=self.candidate, job=job, is_invited=True, score=80)
+    application = Application.objects.create(user=self.candidate, job=job)
+
+    response = self.client.patch(reverse('user_profile'), {'email_notifications': False}, format='json')
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertFalse(response.data['email_notifications'])
+
+    self.client.force_authenticate(user=employer)
+    start = self.client.post(reverse('conversations'), {'candidate': self.candidate.id, 'job': job.id, 'body': 'Hello'}, format='json')
+    self.assertEqual(start.status_code, status.HTTP_201_CREATED)
+    self.client.patch(reverse('application_detail', args=[application.id]), {'status': 's'}, format='json')
+    self.assertEqual(Message.objects.count(), 2)
+    self.assertEqual(len(mail.outbox), 0)
+
+    # Opting back in resumes them.
+    MyUser.objects.filter(pk=self.candidate.pk).update(email_notifications=True)
+    self.client.post(reverse('conversation_messages', args=[start.data['conversation']['id']]), {'body': 'Again'}, format='json')
+    self.assertEqual(len(mail.outbox), 1)

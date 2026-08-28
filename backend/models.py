@@ -64,7 +64,8 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   last_name = models.CharField(max_length=100)
   email = models.EmailField(max_length=300, unique=True)
   user_name = models.CharField(max_length=150, unique=True)
-  password = models.CharField(max_length=50)
+  # No max_length override: AbstractBaseUser's 128 fits a PBKDF2 hash; the old
+  # max_length=50 only survived because SQLite ignores VARCHAR lengths.
   photo = models.CharField(max_length=500, blank=True, null=True)
   phone_number = models.CharField(max_length=30, blank=True, null=True)
   dob = models.DateField(blank=True, null=True)
@@ -75,6 +76,12 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   country = models.CharField(max_length=100, blank=True, null=True)
   is_staff = models.BooleanField(default=False)
   is_active = models.BooleanField(default=False)
+  # Account settings. `email_notifications` gates every candidate-facing email
+  # that mirrors an in-app message (manual sends, invites, application status
+  # changes - all one flag, since status changes ARE messages). `pending_email`
+  # holds a requested new address until its verification link is clicked.
+  email_notifications = models.BooleanField(default=True)
+  pending_email = models.EmailField(max_length=300, blank=True, default='')
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
 

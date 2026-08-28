@@ -6,10 +6,11 @@ from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, 
 class MyUserSerializer(serializers.ModelSerializer):
   class Meta:
     model = MyUser
-    fields = ['id', 'first_name', 'last_name', 'email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
+    fields = ['id', 'first_name', 'last_name', 'email', 'pending_email', 'user_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country', 'email_notifications', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
     # user_profile PATCH feeds request.data straight into this serializer, so the
-    # privilege/lifecycle flags must never be client-writable.
-    read_only_fields = ['id', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
+    # privilege/lifecycle flags must never be client-writable. `email` only
+    # changes through the verified flow (account_email_request/confirm).
+    read_only_fields = ['id', 'email', 'pending_email', 'is_staff', 'is_active', 'is_superuser', 'created_at', 'updated_at']
 
 class CompanyBranchSerializer(serializers.ModelSerializer):
   class Meta:

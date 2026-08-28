@@ -50,6 +50,11 @@ DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='Recommender <noreply@rec
 # new-message notifications).
 FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
 
+# Lifetime of password-reset and email-change links (both use Django's
+# PasswordResetTokenGenerator, which reads this setting). Email VERIFICATION
+# links keep their own 3-day window - see tokens.EmailVerificationTokenGenerator.
+PASSWORD_RESET_TIMEOUT = 3600
+
 # Public name of the product, used in email subjects/bodies and the email
 # template's wordmark. Change it in .env to rebrand every email at once.
 WEBSITE_NAME = env('WEBSITE_NAME', default='Recommender App')

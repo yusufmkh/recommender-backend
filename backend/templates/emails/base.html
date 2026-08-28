@@ -7,7 +7,9 @@
 {#                 headed by the sender's photo (or initial) + name #}
 {#   cta         - optional {label, url} #}
 {#   outro       - list of paragraphs below the CTA #}
+{#   note        - optional small-print line under the CTA (same style as the copy-link hint) #}
 {#   footer_note - small print at the bottom (why you got this) #}
+{#   unsubscribe_url - optional one-click opt-out link shown in the footer #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -84,6 +86,10 @@
               </p>
               {% endif %}
 
+              {% if note %}
+              <p style="margin:0 0 16px 0;font-size:13px;line-height:1.5;color:#71717a;">{{ note }}</p>
+              {% endif %}
+
               {% for paragraph in outro %}
               <p style="margin:0 0 16px 0;">{{ paragraph }}</p>
               {% endfor %}
@@ -96,6 +102,7 @@
           <tr>
             <td style="padding:20px 8px 0 8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:1.5;color:#a1a1aa;">
               {% if footer_note %}<p style="margin:0 0 6px 0;">{{ footer_note }}</p>{% endif %}
+              {% if unsubscribe_url %}<p style="margin:0 0 6px 0;"><a href="{{ unsubscribe_url }}" style="color:#71717a;text-decoration:underline;">Unsubscribe from message emails</a></p>{% endif %}
               <p style="margin:0;">{{ website_name }} · Hospitality jobs in London · <a href="{{ frontend_url }}" style="color:#a1a1aa;">{{ frontend_host }}</a></p>
             </td>
           </tr>
