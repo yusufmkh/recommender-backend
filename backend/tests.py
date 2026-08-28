@@ -579,6 +579,130 @@ class ApplicationTests(APITestCase):
       cache.clear()
 
 
+class InviteTests(APITestCase):
+  """Inviting a candidate posts a company-voiced message into the (job,
+  candidate) thread - exactly once per match row, however many times the
+  button is pressed. No cache.clear() needed here: neither match_invite nor
+  application_detail is throttled, and the append test creates its
+  Application via the ORM rather than the throttled apply endpoint."""
+
+  def _employer(self, slug):
+    user = MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
+      password='pw12345678', is_active=True,
+    )
+    company = Company.objects.create(
+      user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
+      address='1 Road', postcode='E1', city='London', state='London', country='UK',
+    )
+    return user, company
+
+  def _candidate(self, slug):
+    return MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Candidate',
+      password='pw12345678', is_active=True,
+    )
+
+  def setUp(self):
+    self.employer, self.company = self._employer('alpha')
+    self.other_employer, self.other_company = self._employer('beta')
+
+    self.job = Job.objects.create(company=self.company, title='Chef', description='Cook')
+    self.closed_job = Job.objects.create(company=self.company, title='Old Chef', description='Cooked', status='h')
+
+    self.candidate = self._candidate('invitee')
+    self.match = Match.objects.create(user=self.candidate, job=self.job, score=77)
+
+    self.client.force_authenticate(user=self.employer)
+
+  def _invite(self, match, user=None):
+    if user:
+      self.client.force_authenticate(user=user)
+    return self.client.patch(reverse('match_invite', args=[match.id]))
+
+  def _unread(self, user):
+    self.client.force_authenticate(user=user)
+    return self.client.get(reverse('conversations_unread_count')).data
+
+  def test_invite_flips_the_match_and_messages_the_candidate(self):
+    response = self._invite(self.match)
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertTrue(response.data['is_invited'])
+    self.assertNotIn('already_invited', response.data)
+
+    conversation = Conversation.objects.get(job=self.job, candidate=self.candidate)
+    messages = list(conversation.messages.all())
+    self.assertEqual(len(messages), 1)
+    self.assertEqual(messages[0].sender, self.employer)
+    self.assertEqual(
+      messages[0].body,
+      'You’ve been invited to apply for Chef. You’ll find it in the Invited tab of your matches.',
+    )
+    self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 1})
+    self.assertEqual(self._unread(self.employer), {'unread_conversations': 0, 'unread_messages': 0})
+
+    # Candidates see the company as the counterpart, never the employer user.
+    self.client.force_authenticate(user=self.candidate)
+    inbox = self.client.get(reverse('conversations')).data
+    self.assertEqual(inbox['conversations'][0]['counterpart']['name'], 'alpha Ltd')
+
+  def test_re_invite_is_idempotent(self):
+    self._invite(self.match)
+    response = self._invite(self.match)
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertTrue(response.data['already_invited'])
+    self.assertTrue(response.data['is_invited'])
+    self.assertEqual(Message.objects.count(), 1)
+    self.assertEqual(Conversation.objects.count(), 1)
+    self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 1})
+
+  def test_only_the_job_owner_can_invite(self):
+    self.assertEqual(self._invite(self.match, user=self.other_employer).status_code, status.HTTP_403_FORBIDDEN)
+    self.assertEqual(self._invite(self.match, user=self.candidate).status_code, status.HTTP_403_FORBIDDEN)
+    self.client.force_authenticate(user=self.employer)
+    self.assertEqual(self.client.patch(reverse('match_invite', args=[9999])).status_code, status.HTTP_404_NOT_FOUND)
+
+    self.match.refresh_from_db()
+    self.assertFalse(self.match.is_invited)
+    self.assertEqual(Conversation.objects.count(), 0)
+
+  def test_invite_after_status_change_appends_to_the_existing_thread(self):
+    application = Application.objects.create(user=self.candidate, job=self.job)
+    self.client.patch(reverse('application_detail', args=[application.id]), {'status': 's'}, format='json')
+    self.assertEqual(Conversation.objects.count(), 1)
+
+    self._invite(self.match)
+
+    conversation = Conversation.objects.get(job=self.job, candidate=self.candidate)
+    bodies = [m.body for m in conversation.messages.all()]
+    self.assertEqual(len(bodies), 2)
+    # They already applied, so the role isn't in their deck - no tab pointer.
+    self.assertEqual(bodies[-1], 'You’ve been invited to apply for Chef.')
+    self.assertEqual(Conversation.objects.count(), 1)
+    self.assertEqual(self._unread(self.candidate), {'unread_conversations': 1, 'unread_messages': 2})
+
+  def test_invite_on_a_closed_job_does_not_promise_the_deck(self):
+    match = Match.objects.create(user=self.candidate, job=self.closed_job, score=50)
+
+    self.assertEqual(self._invite(match).status_code, status.HTTP_200_OK)
+    conversation = Conversation.objects.get(job=self.closed_job, candidate=self.candidate)
+    self.assertEqual(conversation.messages.first().body, 'You’ve been invited to apply for Old Chef.')
+
+  def test_invited_candidate_can_reply(self):
+    self._invite(self.match)
+    conversation = Conversation.objects.get(job=self.job, candidate=self.candidate)
+
+    # Born with the invite message, so the "employer messaged first" invariant
+    # that lets candidates reply holds for invite-created threads too.
+    self.client.force_authenticate(user=self.candidate)
+    reply = self.client.post(
+      reverse('conversation_messages', args=[conversation.id]), {'body': 'Thanks — keen to talk'}, format='json',
+    )
+    self.assertEqual(reply.status_code, status.HTTP_201_CREATED)
+
+
 class MessagingTests(APITestCase):
   """An employer may only open a thread about a job with a candidate they invited
   to it or who applied to it; candidates can only ever reply. Threads are created

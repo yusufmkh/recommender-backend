@@ -519,7 +519,7 @@ def company_dashboard(request, format=None):
 @permission_classes([IsAuthenticated])
 def match_invite(request, id, format=None):
   try:
-    match = Match.objects.get(pk=id)
+    match = Match.objects.select_related('job__company', 'user').get(pk=id)
   except Match.DoesNotExist:
     return Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -527,10 +527,24 @@ def match_invite(request, id, format=None):
   if match.job.company is None or match.job.company.user_id != request.user.id:
     return Response(status=status.HTTP_403_FORBIDDEN)
 
-  match.is_invited = True
-  match.save()
+  # Mirrors the candidate deck's filter (active job, not yet applied) so the
+  # message only promises the Invited tab when the role will really be there.
+  in_deck = match.job.status == 'a' and not Application.objects.filter(user=match.user, job=match.job).exists()
 
-  return Response(MatchSerializer(match).data)
+  with transaction.atomic():
+    # Idempotent AND race-safe: only the request that actually flips the flag
+    # posts the invite message, so a candidate gets exactly one per match row
+    # however many times (or tabs) the button is pressed. .update() bypasses
+    # auto_now, hence the explicit updated_at.
+    flipped = Match.objects.filter(pk=match.pk, is_invited=False).update(is_invited=True, updated_at=timezone.now())
+    if flipped:
+      _post_employer_message(match.job, match.user, request.user, _invite_message(match.job, in_deck))
+
+  match.is_invited = True
+  data = MatchSerializer(match).data
+  if not flipped:
+    data['already_invited'] = True
+  return Response(data)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -717,6 +731,15 @@ def _status_change_message(job, new_status):
     'r': f'Thank you for applying for {title}. Unfortunately your application hasn’t been taken forward this time.',
   }[new_status]
 
+def _invite_message(job, in_deck):
+  # Company-voiced, and only points at the Invited tab when the role will
+  # actually be there: the candidate's deck excludes closed jobs and ones
+  # they already applied to.
+  body = f'You’ve been invited to apply for {job.title}.'
+  if in_deck:
+    body += ' You’ll find it in the Invited tab of your matches.'
+  return body
+
 def _notify_status_change(application, actor, role, new_status):
   # Every status change lands in the (job, candidate) message thread, so the
   # other side's inbox and nav badge light up with no notification infra.
@@ -727,19 +750,18 @@ def _notify_status_change(application, actor, role, new_status):
   # whole candidate-side messaging permission. The employer's internal note is
   # deliberately never part of any body.
   if role == 'employer':
-    conversation, _ = Conversation.objects.get_or_create(job=application.job, candidate=application.user)
-    body = _status_change_message(application.job, new_status)
+    _post_employer_message(application.job, application.user, actor, _status_change_message(application.job, new_status))
+    return
+  conversation = Conversation.objects.filter(job=application.job, candidate=application.user).first()
+  if conversation is None:
+    return
+  if new_status == 'w':
+    body = f'I’ve withdrawn my application for {application.job.title}.'
   else:
-    conversation = Conversation.objects.filter(job=application.job, candidate=application.user).first()
-    if conversation is None:
-      return
-    if new_status == 'w':
-      body = f'I’ve withdrawn my application for {application.job.title}.'
-    else:
-      body = f'I’ve re-applied for {application.job.title}.'
+    body = f'I’ve re-applied for {application.job.title}.'
   Message.objects.create(conversation=conversation, sender=actor, body=body)
   # The acting side has, by construction, read its own message.
-  _mark_read(conversation, role)
+  _mark_read(conversation, 'candidate')
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
@@ -950,6 +972,17 @@ def _mark_read(conversation, role):
   field = 'candidate_last_read_at' if role == 'candidate' else 'employer_last_read_at'
   setattr(conversation, field, timezone.now())
   conversation.save(update_fields=[field, 'updated_at'])
+
+def _post_employer_message(job, candidate, actor, body):
+  # The company's side of a thread in one place: opens the (job, candidate)
+  # thread if needed, appends the message and marks the employer side read
+  # (the sender has, by construction, read their own message). Used by the
+  # automatic status-change and invite messages; callers hold the gate - they
+  # own the job and the candidate was invited to it or applied.
+  conversation, _ = Conversation.objects.get_or_create(job=job, candidate=candidate)
+  Message.objects.create(conversation=conversation, sender=actor, body=body)
+  _mark_read(conversation, 'employer')
+  return conversation
 
 def _clean_message_body(raw):
   body = raw.strip() if isinstance(raw, str) else ''
