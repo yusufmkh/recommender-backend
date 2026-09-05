@@ -2,6 +2,9 @@ from django.db import models
 from django.db.models.functions import Lower
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
+from django.core.exceptions import ValidationError
+
+from .roles import ROLE_CANDIDATE, ROLE_CHOICES, ROLE_EMPLOYER
 
 PAY_RANGE_OPTIONS = (
   ('pay20_30', '20,000 - 30,000'),
@@ -76,6 +79,10 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   country = models.CharField(max_length=100, blank=True, null=True)
   is_staff = models.BooleanField(default=False)
   is_active = models.BooleanField(default=False)
+  # Which side of the marketplace this account is. Set at sign-up
+  # (employer_register stamps 'employer'), never client-writable, and
+  # exclusive for the life of the account - see roles.py for the contract.
+  role = models.CharField(max_length=9, choices=ROLE_CHOICES, default=ROLE_CANDIDATE, db_index=True)
   # Account settings. `email_notifications` gates every candidate-facing email
   # that mirrors an in-app message (manual sends, invites, application status
   # changes - all one flag, since status changes ARE messages). `pending_email`
@@ -94,7 +101,9 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
     return self.user_name
   
 class Company(models.Model):
-  user = models.OneToOneField(get_user_model(), related_name="company", on_delete=models.DO_NOTHING)
+  # PROTECT (was DO_NOTHING, which SQLite turned into a commit-time FK error):
+  # deleting an employer user fails cleanly until their Company goes first.
+  user = models.OneToOneField(get_user_model(), related_name="company", on_delete=models.PROTECT)
   name = models.CharField(max_length=100)
   legal_name = models.CharField(max_length=100, blank=True)
   email = models.EmailField(max_length=254)
@@ -113,6 +122,12 @@ class Company(models.Model):
   country = models.CharField(max_length=100)
   created_at = models.DateTimeField(auto_now_add=True)
   updated_at = models.DateTimeField(auto_now=True)
+
+  def clean(self):
+    # Belt-and-braces for the admin (DRF writes skip full_clean): a Company
+    # can only ever hang off an employer account.
+    if self.user_id and self.user.role != ROLE_EMPLOYER:
+      raise ValidationError('A company can only belong to an employer account.')
 
   def __str__(self):
     return self.name

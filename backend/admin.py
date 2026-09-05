@@ -5,16 +5,17 @@ from .models import MyUser, Job, Company, CompanyBranch, WorkExperience, Skill, 
 class UserAdminConfig(UserAdmin):
   search_fields = ('email', 'user_name', 'first_name', 'last_name')
   ordering = ('-created_at',)
-  list_display = ('email', 'user_name', 'first_name', 'last_name', 'is_staff', 'is_active')
+  list_display = ('email', 'user_name', 'first_name', 'last_name', 'role', 'is_staff', 'is_active')
+  list_filter = ('role', 'is_staff', 'is_active')
   fieldsets = (
     (None, {'fields': ('email', 'user_name', 'password', 'first_name', 'last_name')}),
-    ('Permissions', {'fields': ('is_staff', 'is_active')}),
+    ('Permissions', {'fields': ('role', 'is_staff', 'is_active')}),
     ('Personal', {'fields': ('photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country')})
   )
   add_fieldsets = (
     (None, {
       'classes': ('wide',),
-      'fields': ('email', 'user_name', 'password1', 'password2', 'is_staff', 'is_active', 'first_name', 'last_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country',)
+      'fields': ('email', 'user_name', 'password1', 'password2', 'role', 'is_staff', 'is_active', 'first_name', 'last_name', 'photo', 'phone_number', 'dob', 'address', 'postcode', 'city', 'state', 'country',)
     }),
   )
 

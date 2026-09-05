@@ -19,16 +19,19 @@ from django.urls import path
 from rest_framework.urlpatterns import format_suffix_patterns
 
 from backend import views
-from backend.token_views import EmailAwareTokenObtainPairView
-
-from rest_framework_simplejwt.views import (
-    TokenRefreshView,
+from backend.token_views import (
+    EmailAwareTokenObtainPairView,
+    RoleStampingTokenRefreshView,
+    SignOutTokenBlacklistView,
 )
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     path('api/token/', EmailAwareTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/token/refresh/', RoleStampingTokenRefreshView.as_view(), name='token_refresh'),
+    # Real sign-out: the frontend revokes the refresh token here (best effort)
+    # before clearing its cookies, instead of leaving it live for 10 days.
+    path('api/token/blacklist/', SignOutTokenBlacklistView.as_view(), name='token_blacklist'),
     path("api/user_register/", views.user_register, name="user_register"),
     path("api/employer_register/", views.employer_register, name="employer_register"),
     path("api/password_reset/request/", views.password_reset_request, name="password_reset_request"),
@@ -46,7 +49,6 @@ urlpatterns = [
     path("api/skills/", views.skills, name="skills"),
     path("api/user_preferences/", views.user_preferences, name="user_preferences"),
     path("api/photo/presign/", views.photo_presign, name="photo_presign"),
-    path("api/company_register/", views.company_register, name="company_register"),
     path("api/company/", views.company_profile, name="company_profile"),
     path("api/company/branches/", views.company_branches, name="company_branches"),
     path("api/company/branches/<int:id>/", views.company_branch_details, name="company_branch_details"),

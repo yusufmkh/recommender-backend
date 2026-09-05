@@ -6,9 +6,12 @@ from django.core.cache import cache
 from django.db import connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
-from django.urls import reverse
+from django.urls import NoReverseMatch, reverse
 from rest_framework import status
 from rest_framework.test import APITestCase, APIClient
+# The dual-backend classes (backend/jwt.py) — the stock simplejwt ones verify
+# against SECRET_KEY only and can't read tokens signed with JWT_SIGNING_KEY.
+from backend.jwt import AccessToken, RefreshToken
 
 from .models import MyUser, Company, CompanyBranch, Job, Match, Application, ApplicationEvent, SavedCandidate, WorkExperience, Conversation, Message
 from .serializers import MyUserSerializer
@@ -75,7 +78,7 @@ class EmployerShortlistTests(APITestCase):
   def _employer(self, slug):
     user = MyUser.objects.create_user(
       email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
-      password='pw12345678', is_active=True,
+      password='pw12345678', is_active=True, role='employer',
     )
     company = Company.objects.create(
       user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
@@ -287,7 +290,7 @@ class ApplicationTests(APITestCase):
   def _employer(self, slug):
     user = MyUser.objects.create_user(
       email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
-      password='pw12345678', is_active=True,
+      password='pw12345678', is_active=True, role='employer',
     )
     company = Company.objects.create(
       user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
@@ -626,7 +629,7 @@ class InviteTests(APITestCase):
   def _employer(self, slug):
     user = MyUser.objects.create_user(
       email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
-      password='pw12345678', is_active=True,
+      password='pw12345678', is_active=True, role='employer',
     )
     company = Company.objects.create(
       user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
@@ -753,7 +756,7 @@ class MessagingTests(APITestCase):
   def _employer(self, slug):
     user = MyUser.objects.create_user(
       email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
-      password='pw12345678', is_active=True,
+      password='pw12345678', is_active=True, role='employer',
     )
     company = Company.objects.create(
       user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
@@ -1202,7 +1205,7 @@ class AccountSettingsTests(APITestCase):
 
   @override_settings(FRONTEND_URL='http://testserver')
   def test_message_emails_link_to_the_notification_settings(self):
-    employer = MyUser.objects.create_user(email='emp2@test.com', user_name='emp2', first_name='E', last_name='R', password='pw12345678', is_active=True)
+    employer = MyUser.objects.create_user(email='emp2@test.com', user_name='emp2', first_name='E', last_name='R', password='pw12345678', is_active=True, role='employer')
     company = Company.objects.create(user=employer, name='Beta Ltd', email='emp2@test.com', phone_number='0', address='1 Road', postcode='E1', city='London', state='London', country='UK')
     job = Job.objects.create(company=company, title='Chef', description='Cook')
     Match.objects.create(user=self.candidate, job=job, is_invited=True, score=80)
@@ -1224,7 +1227,7 @@ class AccountSettingsTests(APITestCase):
   # --- notifications opt-out ---
 
   def test_opting_out_stops_message_emails_but_not_messages(self):
-    employer = MyUser.objects.create_user(email='emp@test.com', user_name='emp', first_name='E', last_name='R', password='pw12345678', is_active=True)
+    employer = MyUser.objects.create_user(email='emp@test.com', user_name='emp', first_name='E', last_name='R', password='pw12345678', is_active=True, role='employer')
     company = Company.objects.create(user=employer, name='Alpha Ltd', email='emp@test.com', phone_number='0', address='1 Road', postcode='E1', city='London', state='London', country='UK')
     job = Job.objects.create(company=company, title='Chef', description='Cook')
     Match.objects.create(user=self.candidate, job=job, is_invited=True, score=80)
@@ -1245,3 +1248,265 @@ class AccountSettingsTests(APITestCase):
     MyUser.objects.filter(pk=self.candidate.pk).update(email_notifications=True)
     self.client.post(reverse('conversation_messages', args=[start.data['conversation']['id']]), {'body': 'Again'}, format='json')
     self.assertEqual(len(mail.outbox), 1)
+
+
+class RoleSeparationTests(APITestCase):
+  """The IsCandidate/IsEmployer matrix (backend/roles.py): each side's
+  endpoints refuse the other side's token with a 403 - including the routes
+  that used to 500 on a candidate token (company_branches, jobs POST) and the
+  application POST that used to accept any authenticated user."""
+
+  def setUp(self):
+    # The `applications` throttle counts per user id in the process-wide cache
+    # (see ApplicationTests.setUp).
+    cache.clear()
+    self.employer, self.company = self._employer('sep-emp')
+    self.candidate = self._candidate('sep-cand')
+
+  def _employer(self, slug):
+    user = MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Employer',
+      password='pw12345678', is_active=True, role='employer',
+    )
+    company = Company.objects.create(
+      user=user, name=f'{slug} Ltd', email=f'{slug}@test.com', phone_number='0',
+      address='1 Road', postcode='E1', city='London', state='London', country='UK',
+    )
+    return user, company
+
+  def _candidate(self, slug):
+    return MyUser.objects.create_user(
+      email=f'{slug}@test.com', user_name=slug, first_name=slug, last_name='Candidate',
+      password='pw12345678', is_active=True,
+    )
+
+  # (method, url name, args) - permissions run before any lookup, so dummy ids
+  # and empty bodies are enough to prove the 403.
+  EMPLOYER_ONLY = (
+    ('get', 'company_dashboard', ()),
+    ('get', 'company_profile', ()),
+    ('get', 'company_branches', ()),   # used to 500 (uncaught DoesNotExist)
+    ('post', 'company_branches', ()),
+    ('post', 'jobs', ()),              # used to 500 (uncaught DoesNotExist)
+    ('patch', 'match_invite', (1,)),
+    ('get', 'candidate_profile', (1,)),
+    ('post', 'company_saved_candidates', ()),
+    ('patch', 'company_saved_candidate_details', (1,)),
+    ('post', 'conversations', ()),
+  )
+
+  CANDIDATE_ONLY = (
+    ('get', 'user_dashboard', ()),
+    ('get', 'user_work_experiences', ()),
+    ('post', 'user_work_experiences', ()),
+    ('get', 'user_work_experience_details', (1,)),
+    ('get', 'user_preferences', ()),
+    ('get', 'saved_jobs', ()),
+    ('post', 'saved_jobs', ()),
+    ('get', 'applications', ()),
+    ('post', 'applications', ()),
+  )
+
+  def _request(self, method, name, args):
+    return getattr(self.client, method)(reverse(name, args=args or None), {}, format='json')
+
+  def test_candidate_tokens_are_refused_on_employer_endpoints(self):
+    self.client.force_authenticate(user=self.candidate)
+    for method, name, args in self.EMPLOYER_ONLY:
+      response = self._request(method, name, args)
+      self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, f'{method} {name} -> {response.status_code}')
+
+  def test_employer_tokens_are_refused_on_candidate_endpoints(self):
+    self.client.force_authenticate(user=self.employer)
+    for method, name, args in self.CANDIDATE_ONLY:
+      response = self._request(method, name, args)
+      self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN, f'{method} {name} -> {response.status_code}')
+
+  def test_employer_cannot_apply_to_another_companys_job(self):
+    # Regression: applying used to be open to any authenticated user; only
+    # applying to your OWN job was blocked.
+    _, other_company = self._employer('sep-other')
+    job = Job.objects.create(company=other_company, title='Chef', description='Cook')
+
+    self.client.force_authenticate(user=self.employer)
+    response = self.client.post(reverse('applications'), {'job': job.id}, format='json')
+
+    self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+    self.assertFalse(Application.objects.exists())
+
+  def test_shared_endpoints_serve_both_roles(self):
+    for user in (self.candidate, self.employer):
+      self.client.force_authenticate(user=user)
+      for name in ('user_profile', 'skills', 'jobs', 'conversations', 'conversations_unread_count'):
+        response = self.client.get(reverse(name))
+        self.assertEqual(response.status_code, status.HTTP_200_OK, f'{name} for {user.user_name}')
+
+  def test_anonymous_requests_are_401_not_403(self):
+    for name in ('user_dashboard', 'company_dashboard', 'user_profile'):
+      response = self.client.get(reverse(name))
+      self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED, name)
+
+  def test_company_register_route_is_gone(self):
+    # The old self-promotion endpoint (any candidate could create a Company
+    # for themselves) must stay deleted.
+    with self.assertRaises(NoReverseMatch):
+      reverse('company_register')
+
+  def test_every_company_user_is_an_employer(self):
+    # The integrity invariant the backfill migration establishes and the
+    # sign-up flows maintain.
+    self.assertFalse(Company.objects.exclude(user__role='employer').exists())
+
+
+class JwtClaimTests(APITestCase):
+  """The JWT role claim: stamped at login, present in both tokens, and
+  re-stamped from the DB on every refresh (RoleStampingTokenRefreshSerializer)
+  so pre-claim sessions self-heal without a re-login and a role edit can
+  never outlive one access-token lifetime."""
+
+  def setUp(self):
+    cache.clear()
+    self.candidate = MyUser.objects.create_user(
+      email='claim-cand@test.com', user_name='claimcand', first_name='C', last_name='One',
+      password='pw12345678', is_active=True,
+    )
+    self.employer = MyUser.objects.create_user(
+      email='claim-emp@test.com', user_name='claimemp', first_name='E', last_name='Two',
+      password='pw12345678', is_active=True, role='employer',
+    )
+
+  def _login(self, email):
+    return APIClient().post(reverse('token_obtain_pair'), {'email': email, 'password': 'pw12345678'}, format='json')
+
+  def _refresh(self, refresh_token):
+    return APIClient().post(reverse('token_refresh'), {'refresh': refresh_token}, format='json')
+
+  def test_login_stamps_the_role_into_both_tokens(self):
+    for user, expected in ((self.candidate, 'candidate'), (self.employer, 'employer')):
+      response = self._login(user.email)
+      self.assertEqual(response.status_code, status.HTTP_200_OK)
+      self.assertEqual(response.data['role'], expected)
+      self.assertEqual(AccessToken(response.data['access'])['role'], expected)
+      self.assertEqual(RefreshToken(response.data['refresh'])['role'], expected)
+
+  def test_refresh_restamps_a_legacy_claimless_token(self):
+    # for_user goes around the obtain serializer, exactly like every refresh
+    # token minted before the claim shipped.
+    legacy = RefreshToken.for_user(self.employer)
+    self.assertNotIn('role', legacy.payload)
+
+    response = self._refresh(str(legacy))
+
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+    self.assertEqual(response.data['role'], 'employer')
+    self.assertEqual(AccessToken(response.data['access'])['role'], 'employer')
+    self.assertEqual(RefreshToken(response.data['refresh'])['role'], 'employer')
+
+  def test_refresh_carries_the_claim_through_rotation(self):
+    login = self._login(self.candidate.email)
+    first = self._refresh(login.data['refresh'])
+    second = self._refresh(first.data['refresh'])
+    self.assertEqual(AccessToken(second.data['access'])['role'], 'candidate')
+
+  def test_refresh_reflects_a_db_role_change(self):
+    # Roles are fixed at sign-up product-wise; the mechanism still guarantees
+    # an admin edit propagates within one access lifetime, not ten days.
+    login = self._login(self.candidate.email)
+    MyUser.objects.filter(pk=self.candidate.pk).update(role='employer')
+    refreshed = self._refresh(login.data['refresh'])
+    self.assertEqual(refreshed.data['role'], 'employer')
+    self.assertEqual(AccessToken(refreshed.data['access'])['role'], 'employer')
+
+
+class PermissionDefaultTests(APITestCase):
+  """DEFAULT_PERMISSION_CLASSES is IsAuthenticated; the only public API routes
+  are the explicit AllowAny ones (plus the token pair, whose simplejwt views
+  run permission-less by design). Catches any future view that gets added
+  without a deliberate auth decision."""
+
+  PUBLIC = {
+    'user_register', 'employer_register',
+    'password_reset_request', 'password_reset_confirm',
+    'email_verify_confirm', 'email_verify_resend',
+    'account_email_confirm',
+    'token_obtain_pair', 'token_refresh', 'token_blacklist',
+  }
+
+  def test_every_api_route_declares_its_permissions(self):
+    from rest_framework.permissions import AllowAny
+    from backend.urls import urlpatterns
+
+    seen = set()
+    for pattern in urlpatterns:
+      name = getattr(pattern, 'name', None)
+      if name is None or name in seen or not str(pattern.pattern).startswith('api/'):
+        continue
+      seen.add(name)
+      view_cls = getattr(pattern.callback, 'cls', None) or getattr(pattern.callback, 'view_class', None)
+      self.assertIsNotNone(view_cls, f'{name} is not a DRF view')
+      perms = list(getattr(view_cls, 'permission_classes', []))
+      if name in self.PUBLIC:
+        self.assertTrue(AllowAny in perms or perms == [], f'{name} should be explicitly public')
+      else:
+        self.assertTrue(perms and AllowAny not in perms, f'{name} must require authentication')
+    # The sweep must actually have seen the API surface.
+    self.assertGreater(len(seen), 20)
+
+
+class JwtSigningKeyTests(APITestCase):
+  """backend/jwt.py: tokens sign with the dedicated JWT_SIGNING_KEY, legacy
+  SECRET_KEY-signed tokens keep verifying during the rotation window, real
+  sign-out revokes the refresh token, and the credential endpoints throttle."""
+
+  def setUp(self):
+    cache.clear()  # login/token_refresh throttles count per IP across tests
+    self.user = MyUser.objects.create_user(
+      email='key@test.com', user_name='keyuser', first_name='K', last_name='One',
+      password='pw12345678', is_active=True,
+    )
+
+  def _login(self, password='pw12345678'):
+    return APIClient().post(reverse('token_obtain_pair'), {'email': 'key@test.com', 'password': password}, format='json')
+
+  @override_settings(JWT_SIGNING_KEY='dedicated-test-key')
+  def test_tokens_sign_with_the_dedicated_key(self):
+    from django.conf import settings as django_settings
+    from rest_framework_simplejwt.backends import TokenBackend
+    from rest_framework_simplejwt.exceptions import TokenBackendError
+
+    access = self._login().data['access']
+    # Verifies under the dedicated key...
+    TokenBackend(algorithm='HS256', signing_key='dedicated-test-key').decode(access)
+    # ...and is no longer signed with SECRET_KEY.
+    with self.assertRaises(TokenBackendError):
+      TokenBackend(algorithm='HS256', signing_key=django_settings.SECRET_KEY).decode(access)
+
+  def test_legacy_signed_refresh_survives_the_key_rotation(self):
+    from rest_framework_simplejwt.backends import TokenBackend
+
+    with override_settings(JWT_SIGNING_KEY=''):
+      legacy_refresh = self._login().data['refresh']  # signed with SECRET_KEY
+
+    with override_settings(JWT_SIGNING_KEY='rotated-test-key'):
+      response = APIClient().post(reverse('token_refresh'), {'refresh': legacy_refresh}, format='json')
+      self.assertEqual(response.status_code, status.HTTP_200_OK)
+      # The rotated pair is on the NEW key, role claim included.
+      TokenBackend(algorithm='HS256', signing_key='rotated-test-key').decode(response.data['refresh'])
+      self.assertEqual(response.data['role'], 'candidate')
+      self.assertEqual(AccessToken(response.data['access'])['role'], 'candidate')
+
+  def test_signout_blacklist_revokes_the_refresh_token(self):
+    refresh = self._login().data['refresh']
+
+    response = APIClient().post(reverse('token_blacklist'), {'refresh': refresh}, format='json')
+    self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    reuse = APIClient().post(reverse('token_refresh'), {'refresh': refresh}, format='json')
+    self.assertEqual(reuse.status_code, status.HTTP_401_UNAUTHORIZED)
+
+  def test_login_is_throttled(self):
+    # Failed attempts count (that's the point of a brute-force guard).
+    for _ in range(10):
+      self._login(password='wrong')
+    throttled = self._login(password='wrong')
+    self.assertEqual(throttled.status_code, status.HTTP_429_TOO_MANY_REQUESTS)

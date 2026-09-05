@@ -9,7 +9,7 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework import serializers, status
@@ -19,6 +19,7 @@ from .models import MyUser, Company, CompanyBranch, Job, WorkExperience, Skill, 
 
 from .serializers import MyUserSerializer, CompanySerializer, CompanyBranchSerializer, JobSerializer, WorkExperienceSerializer, SkillSerializer, PreferenceSerializer, SavedJobSerializer, SavedCandidateSerializer, SavedMetaSerializer, MatchSerializer, CompanyCandidateSerializer, CandidateBriefSerializer, ApplicationSerializer, ApplicationEventSerializer, EmployerApplicationEventSerializer, ApplicantRowSerializer, ApplicationQuestionSerializer, ApplicationAnswerSerializer, AttachmentRequirementSerializer, AttachmentAnswerSerializer, MessageSerializer
 
+from .roles import ROLE_EMPLOYER, IsCandidate, IsEmployer, IsEmployerOrReadOnly, company_for, user_role
 from .s3_utils import generate_presigned_post, delete_object
 from .tokens import email_verification_token, email_change_token
 from .emails import send_verification_email, send_password_reset_email, send_new_message_email, send_email_change_email
@@ -116,6 +117,7 @@ def _get_or_create_skills(skill_names):
   return skills
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def user_register(request):
   # Whitelist, don't blacklist: privilege flags are never trusted from the
   # client, and every new account starts inactive until the verification link
@@ -133,6 +135,7 @@ def user_register(request):
   return Response(user_data_serializer.data, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 @transaction.atomic
 def employer_register(request):
   # Creates the user and their company together, atomically, without
@@ -140,6 +143,9 @@ def employer_register(request):
   # inactive until email verification, so no JWT can be issued yet.
   company_fields = ('company_name', 'legal_name', 'company_email', 'company_size', 'phone_number', 'website', 'address', 'postcode', 'city', 'state', 'country')
   user_fields = {k: v for k, v in request.data.items() if k in USER_SELF_FIELDS and k not in company_fields}
+  # The one place an employer account is born: the role is stamped here, never
+  # taken from the body (USER_SELF_FIELDS keeps it out of user_register too).
+  user_fields['role'] = ROLE_EMPLOYER
 
   try:
     user = MyUser.objects.create_user(**user_fields)
@@ -171,6 +177,7 @@ def employer_register(request):
   return Response(MyUserSerializer(user).data, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 @throttle_classes([ScopedRateThrottle])
 def password_reset_request(request):
   email = (request.data.get('email') or '').strip()
@@ -186,6 +193,7 @@ def password_reset_request(request):
 password_reset_request.cls.throttle_scope = 'password_reset'
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def password_reset_confirm(request):
   user = _user_from_uid(request.data.get('uid'))
   token = request.data.get('token')
@@ -201,9 +209,11 @@ def password_reset_confirm(request):
   user.set_password(new_password)
   user.save()
 
-  return Response({'ok': True})
+  # The role lets the frontend link the matching sign-in page.
+  return Response({'ok': True, 'role': user_role(user)})
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def email_verify_confirm(request):
   user = _user_from_uid(request.data.get('uid'))
   token = request.data.get('token')
@@ -215,9 +225,11 @@ def email_verify_confirm(request):
     user.is_active = True
     user.save()
 
-  return Response({'ok': True})
+  # The role lets the frontend link the matching sign-in page.
+  return Response({'ok': True, 'role': user_role(user)})
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 @throttle_classes([ScopedRateThrottle])
 def email_verify_resend(request):
   email = (request.data.get('email') or '').strip()
@@ -294,6 +306,7 @@ def account_email_request(request):
 account_email_request.cls.throttle_scope = 'email_verify'
 
 @api_view(['POST'])
+@permission_classes([AllowAny])
 def account_email_confirm(request):
   # Unauthenticated on purpose: the link may be opened on another device.
   user = _user_from_uid(request.data.get('uid'))
@@ -311,7 +324,7 @@ def account_email_confirm(request):
   user.email = user.pending_email
   user.pending_email = ''
   user.save(update_fields=['email', 'pending_email'])
-  return Response({'ok': True, 'email': user.email})
+  return Response({'ok': True, 'email': user.email, 'role': user_role(user)})
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -320,7 +333,7 @@ def account_email_cancel(request):
   return Response({'ok': True})
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 def user_dashboard(request, format=None):
   user_info = MyUser.objects.filter(pk=request.user.id)
   job_matches = Match.objects.filter(user=request.user)
@@ -366,7 +379,7 @@ def user_profile(request, format=None):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 def user_work_experiences(request):
   if request.method == 'GET':
     work_experiences = WorkExperience.objects.filter(user=request.user)
@@ -387,7 +400,7 @@ def user_work_experiences(request):
       return Response(work_experience_serializer.data, status=status.HTTP_201_CREATED)
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 def user_work_experience_details(request, id, format=None):
   # Scoped to the requesting user so a candidate can only read or edit
   # their own work experience, mirroring how job_details scopes to owner.
@@ -437,7 +450,7 @@ def skills(request):
       return Response(skill_serializer.data, status=status.HTTP_201_CREATED)
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 def user_preferences(request):
   if request.method == 'GET':
     preference = Preference.objects.filter(user=request.user).first()
@@ -464,25 +477,10 @@ def user_preferences(request):
     else:
       return Response(user_preferences_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def company_register(request):
-  company_data_serializer = CompanySerializer(data={'user': request.user.id, **request.data})
-
-  if company_data_serializer.is_valid():
-    company_data_serializer.save()
-
-    return Response(company_data_serializer.data, status=status.HTTP_201_CREATED)
-  else:
-    return Response(company_data_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
 @api_view(['GET', 'PATCH'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_profile(request, format=None):
-  try:
-    company = Company.objects.get(user=request.user)
-  except Company.DoesNotExist:
-    return Response(status=status.HTTP_404_NOT_FOUND)
+  company = company_for(request.user)
 
   if request.method == 'GET':
     serializer = CompanySerializer(company)
@@ -498,9 +496,9 @@ def company_profile(request, format=None):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_branches(request, format=None):
-  company = Company.objects.get(user=request.user)
+  company = company_for(request.user)
 
   if request.method == 'GET':
     branches = CompanyBranch.objects.filter(company=company)
@@ -516,7 +514,7 @@ def company_branches(request, format=None):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_branch_details(request, id, format=None):
   try:
     branch = CompanyBranch.objects.get(pk=id, company__user=request.user)
@@ -570,13 +568,9 @@ def photo_presign(request, format=None):
   return Response(presign_data, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_dashboard(request, format=None):
-  try:
-    company_info = Company.objects.get(user=request.user)
-  except Company.DoesNotExist:
-    # A candidate token landing here is "not an employer", not a server error.
-    return Response(status=status.HTTP_403_FORBIDDEN)
+  company_info = company_for(request.user)
   company_jobs, all_matches, visible_matches, rows = _company_candidates(company_info)
   # work_experiences feed ApplicantRowSerializer.total_experience_months -
   # prefetched so the applicant list stays query-flat however long it gets.
@@ -618,7 +612,7 @@ def company_dashboard(request, format=None):
   )
 
 @api_view(['PATCH'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def match_invite(request, id, format=None):
   try:
     match = Match.objects.select_related('job__company', 'user').get(pk=id)
@@ -649,7 +643,7 @@ def match_invite(request, id, format=None):
   return Response(data)
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def candidate_profile(request, user_id, format=None):
   if not _company_can_view_candidate(request.user, user_id):
     return Response(status=status.HTTP_403_FORBIDDEN)
@@ -669,7 +663,7 @@ def candidate_profile(request, user_id, format=None):
   })
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployerOrReadOnly])
 def jobs(request, format=None):
   if request.method == 'GET':
     jobs = Job.objects.all()
@@ -677,7 +671,7 @@ def jobs(request, format=None):
     return Response(jobs_serializer.data)
 
   if request.method == 'POST':
-    company = Company.objects.get(user=request.user)
+    company = company_for(request.user)
 
     job_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
     job_skills = job_data.pop('skills', [])
@@ -697,7 +691,7 @@ def jobs(request, format=None):
       }, status=status.HTTP_201_CREATED)
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployerOrReadOnly])
 def job_details(request, id, format=None):
   try:
     job = Job.objects.get(pk=id)
@@ -739,7 +733,7 @@ def job_details(request, id, format=None):
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 def saved_jobs(request):
   if request.method == 'GET':
     saved_jobs = SavedJob.objects.filter(user=request.user)
@@ -757,14 +751,11 @@ def saved_jobs(request):
       return Response(saved_job_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_saved_candidates(request):
   # The company is always derived from the token - never taken from the client -
   # so one employer can't read or write another's shortlist.
-  try:
-    company = Company.objects.get(user=request.user)
-  except Company.DoesNotExist:
-    return Response(status=status.HTTP_404_NOT_FOUND)
+  company = company_for(request.user)
 
   candidate_id = request.data.get('user')
   if not candidate_id:
@@ -787,7 +778,7 @@ def company_saved_candidates(request):
   return Response(serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 @api_view(['PATCH', 'DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployer])
 def company_saved_candidate_details(request, id, format=None):
   # Scoped to the requesting employer's own company, so another company's row is
   # indistinguishable from one that doesn't exist.
@@ -866,7 +857,7 @@ def _notify_status_change(application, actor, role, new_status):
   _mark_read(conversation, 'candidate')
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsCandidate])
 @throttle_classes([PostScopedRateThrottle])
 def job_applications(request):
   if request.method == 'GET':
@@ -908,9 +899,6 @@ def job_applications(request):
       job = Job.objects.select_related('company').get(pk=job_id)
     except Job.DoesNotExist:
       return Response({'error': 'Job not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-    if job.company is not None and job.company.user_id == request.user.id:
-      return Response({'error': 'You cannot apply to your own job.'}, status=status.HTTP_403_FORBIDDEN)
 
     if job.status != 'a':
       return Response({'error': 'This job is no longer accepting applications.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1208,7 +1196,7 @@ def _unread_by_conversation(user, conversations):
   return unread
 
 @api_view(['GET', 'POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsEmployerOrReadOnly])
 @throttle_classes([PostScopedRateThrottle])
 def conversations(request, format=None):
   if request.method == 'GET':

@@ -27,6 +27,12 @@ environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = env('SECRET_KEY')
 
+# Dedicated JWT signing key (backend/jwt.py). Kept separate from SECRET_KEY so
+# the frontend middleware can verify token signatures without holding the key
+# behind password-reset/email-change links and Django sessions. Empty falls
+# back to SECRET_KEY (dev/CI without a .env keep working, unsigned-edge mode).
+JWT_SIGNING_KEY = env('JWT_SIGNING_KEY', default='')
+
 # AWS S3 (company photo uploads)
 AWS_ACCESS_KEY_ID = env('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = env('AWS_SECRET_ACCESS_KEY')
@@ -45,7 +51,7 @@ AWS_SES_REGION_NAME = env('AWS_SES_REGION_NAME', default=AWS_S3_REGION_NAME)
 AWS_SES_REGION_ENDPOINT = f'email.{AWS_SES_REGION_NAME}.amazonaws.com'
 DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='Recommender <noreply@recapp.example>')
 
-# Base URL of the Next.js frontend, used to build links inside emails
+# Base URL of the frontend, used to build links inside emails
 # (verify-email, password reset, and the /candidate/messages/<id> link in
 # new-message notifications).
 FRONTEND_URL = env('FRONTEND_URL', default='http://localhost:3000')
@@ -60,9 +66,11 @@ PASSWORD_RESET_TIMEOUT = 3600
 WEBSITE_NAME = env('WEBSITE_NAME', default='Recommender App')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Env-driven for production (DEBUG=False + real hosts in .env); the defaults
+# keep local dev zero-config.
+DEBUG = env.bool('DEBUG', default=True)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=[])
 
 
 # Application definition
@@ -83,6 +91,13 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    # Secure by default: a view without an explicit @permission_classes needs a
+    # token. The handful of public views (register, password reset, email
+    # verification) declare AllowAny themselves; tests.py sweeps urlpatterns to
+    # prove nothing else slips through.
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
     'DEFAULT_THROTTLE_RATES': {
         'password_reset': '5/hour',
         'email_verify': '5/hour',
@@ -92,13 +107,23 @@ REST_FRAMEWORK = {
         # Application submissions only (creates are idempotent, so retries are
         # cheap); GET list/polling is never throttled.
         'applications': '20/hour',
+        # Credential endpoints (token_views.py): failed logins count, per IP
+        # for anonymous callers. Refresh is sized well above the middleware's
+        # one-exchange-per-access-lifetime cadence.
+        'login': '10/min',
+        'token_refresh': '60/min',
     },
 }
 
 from datetime import timedelta
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=900),
+    # Env-driven so production can run short-lived tokens (the middleware
+    # refreshes silently, and each refresh re-stamps the role claim from the
+    # DB - see token_views.py - so a short lifetime also bounds how long a
+    # stale claim can live). 60 is the documented production value; the long
+    # dev default keeps local sessions painless.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=env.int('JWT_ACCESS_MINUTES', default=900)),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=10),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
@@ -118,7 +143,9 @@ SIMPLE_JWT = {
     "USER_ID_CLAIM": "user_id",
     "USER_AUTHENTICATION_RULE": "rest_framework_simplejwt.authentication.default_user_authentication_rule",
 
-    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
+    # Dual-verify token classes (backend/jwt.py): sign with JWT_SIGNING_KEY,
+    # verify with it first and the legacy SECRET_KEY during rotation.
+    "AUTH_TOKEN_CLASSES": ("backend.jwt.AccessToken",),
     "TOKEN_TYPE_CLAIM": "token_type",
     "TOKEN_USER_CLASS": "rest_framework_simplejwt.models.TokenUser",
 
@@ -129,7 +156,9 @@ SIMPLE_JWT = {
     "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=1),
 
     "TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainPairSerializer",
-    "TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSerializer",
+    # Re-stamps the role claim from the DB on every refresh (default copies
+    # claims verbatim) - pre-claim sessions self-heal, role edits propagate.
+    "TOKEN_REFRESH_SERIALIZER": "backend.token_views.RoleStampingTokenRefreshSerializer",
     "TOKEN_VERIFY_SERIALIZER": "rest_framework_simplejwt.serializers.TokenVerifySerializer",
     "TOKEN_BLACKLIST_SERIALIZER": "rest_framework_simplejwt.serializers.TokenBlacklistSerializer",
     "SLIDING_TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainSlidingSerializer",
@@ -173,7 +202,8 @@ WSGI_APPLICATION = "backend.wsgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        # SQLITE_PATH lets the e2e suite run against a throwaway database.
+        "NAME": env('SQLITE_PATH', default=str(BASE_DIR / "db.sqlite3")),
     }
 }
 
@@ -215,3 +245,17 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Tell Django that we are using the new custom User model
 AUTH_USER_MODEL = 'backend.MyUser'
+# Structured console logging. backend.roles emits `role_denied` warnings when
+# an authenticated token is refused for being on the wrong side of the
+# marketplace - the audit trail for the role separation.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'console': {'format': '{levelname} {asctime} {name} {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'console'},
+    },
+    'root': {'handlers': ['console'], 'level': 'INFO'},
+}
