@@ -1,4 +1,5 @@
 import datetime
+import uuid
 from unittest import mock
 
 from django.core import mail
@@ -15,6 +16,12 @@ from backend.jwt import AccessToken, RefreshToken
 
 from .models import MyUser, Company, CompanyBranch, Job, Match, Application, ApplicationEvent, SavedCandidate, WorkExperience, Conversation, Message
 from .serializers import MyUserSerializer
+
+# A well-formed id that matches nothing, for routes that 403 before they look
+# anything up. Note on comparing ids in `response.data`: a model's own `id`
+# comes back as a str (DRF's UUIDField), but a foreign key rendered by
+# PrimaryKeyRelatedField stays a uuid.UUID - the JSON on the wire is identical.
+ANY_ID = uuid.uuid4()
 
 class CandidateTests(APITestCase):
 
@@ -132,21 +139,21 @@ class EmployerShortlistTests(APITestCase):
   def test_applied_candidate_leaves_candidate_matches(self):
     Application.objects.create(user=self.matched, job=self.job_a)
     dashboard = self._dashboard()
-    self.assertNotIn(self.matched.id, self._user_ids(dashboard['candidate_matches']))
-    self.assertIn(self.other.id, self._user_ids(dashboard['candidate_matches']))
+    self.assertNotIn(str(self.matched.id),self._user_ids(dashboard['candidate_matches']))
+    self.assertIn(str(self.other.id),self._user_ids(dashboard['candidate_matches']))
     # They only applied at company A - still an open match for company B.
-    self.assertIn(self.matched.id, self._user_ids(self._dashboard(self.employer_b)['candidate_matches']))
+    self.assertIn(str(self.matched.id),self._user_ids(self._dashboard(self.employer_b)['candidate_matches']))
 
   def test_withdrawn_application_still_hides_the_match(self):
     Application.objects.create(user=self.matched, job=self.job_a, status='w')
-    self.assertNotIn(self.matched.id, self._user_ids(self._dashboard()['candidate_matches']))
+    self.assertNotIn(str(self.matched.id),self._user_ids(self._dashboard()['candidate_matches']))
 
   def test_applied_job_is_dropped_from_a_saved_candidates_matches(self):
     job_2 = Job.objects.create(company=self.company_a, title='Waiter', description='Serve')
     Match.objects.create(user=self.matched, job=job_2, score=40)
     self._save(self.matched)
     Application.objects.create(user=self.matched, job=self.job_a)
-    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == self.matched.id)
+    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == str(self.matched.id))
     self.assertEqual([m['job'] for m in row['matches']], [job_2.id])
     self.assertEqual(row['top_score'], 40)
 
@@ -155,29 +162,29 @@ class EmployerShortlistTests(APITestCase):
     self.match.save()
     Application.objects.create(user=self.matched, job=self.job_a)
     dashboard = self._dashboard()
-    self.assertNotIn(self.match.id, {invite['id'] for invite in dashboard['candidate_invites']})
+    self.assertNotIn(str(self.match.id),{invite['id'] for invite in dashboard['candidate_invites']})
     # The applicant row still carries the recommender score for that job.
     self.assertEqual(dashboard['job_applicants'][0]['score'], 90)
 
   def test_saving_moves_candidate_to_the_shortlist(self):
     before = self._dashboard()
-    self.assertIn(self.matched.id, self._user_ids(before['candidate_matches']))
+    self.assertIn(str(self.matched.id),self._user_ids(before['candidate_matches']))
     self.assertEqual(before['saved_candidates'], [])
 
     self.assertEqual(self._save(self.matched).status_code, status.HTTP_201_CREATED)
 
     after = self._dashboard()
-    self.assertNotIn(self.matched.id, self._user_ids(after['candidate_matches']))
-    self.assertIn(self.matched.id, self._user_ids(after['saved_candidates']))
+    self.assertNotIn(str(self.matched.id),self._user_ids(after['candidate_matches']))
+    self.assertIn(str(self.matched.id),self._user_ids(after['saved_candidates']))
     # The other matched candidate is untouched.
-    self.assertIn(self.other.id, self._user_ids(after['candidate_matches']))
+    self.assertIn(str(self.other.id),self._user_ids(after['candidate_matches']))
 
   def test_match_rows_survive_and_travel_with_the_candidate(self):
     self._save(self.matched)
 
     self.assertTrue(Match.objects.filter(pk=self.match.pk).exists())
 
-    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == self.matched.id)
+    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == str(self.matched.id))
     # Only this company's job - never the match against company B's job.
     self.assertEqual([m['job'] for m in row['matches']], [self.job_a.id])
     self.assertEqual(row['top_score'], 90)
@@ -190,14 +197,14 @@ class EmployerShortlistTests(APITestCase):
     self._save(self.matched)
 
     dashboard = self._dashboard()
-    self.assertIn(self.match.id, {invite['id'] for invite in dashboard['candidate_invites']})
-    self.assertNotIn(self.matched.id, self._user_ids(dashboard['candidate_matches']))
+    self.assertIn(str(self.match.id),{invite['id'] for invite in dashboard['candidate_invites']})
+    self.assertNotIn(str(self.matched.id),self._user_ids(dashboard['candidate_matches']))
 
   def test_saved_candidate_with_no_matches_is_still_listed(self):
     self._save(self.matched)
     Match.objects.filter(user=self.matched, job=self.job_a).delete()
 
-    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == self.matched.id)
+    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == str(self.matched.id))
     self.assertEqual(row['matches'], [])
     self.assertIsNone(row['top_score'])
 
@@ -207,7 +214,7 @@ class EmployerShortlistTests(APITestCase):
     dashboard_b = self._dashboard(self.employer_b)
     self.assertEqual(dashboard_b['saved_candidates'], [])
     # Still an untriaged match for company B.
-    self.assertIn(self.matched.id, self._user_ids(dashboard_b['candidate_matches']))
+    self.assertIn(str(self.matched.id),self._user_ids(dashboard_b['candidate_matches']))
 
   def test_saving_twice_returns_the_existing_row(self):
     first = self._save(self.matched, note='Great fit')
@@ -247,14 +254,14 @@ class EmployerShortlistTests(APITestCase):
     patched = self.client.patch(url, {'note': 'Second interview booked'}, format='json')
     self.assertEqual(patched.data['note'], 'Second interview booked')
 
-    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == self.matched.id)
+    row = next(r for r in self._dashboard()['saved_candidates'] if r['user']['id'] == str(self.matched.id))
     self.assertEqual(row['saved']['note'], 'Second interview booked')
 
     self.assertEqual(self.client.delete(url).status_code, status.HTTP_204_NO_CONTENT)
 
     after = self._dashboard()
     self.assertEqual(after['saved_candidates'], [])
-    self.assertIn(self.matched.id, self._user_ids(after['candidate_matches']))
+    self.assertIn(str(self.matched.id),self._user_ids(after['candidate_matches']))
 
   def test_saved_candidate_profile_stays_viewable_without_a_match(self):
     Application.objects.create(user=self.stranger, job=self.job_a)
@@ -398,7 +405,7 @@ class ApplicationTests(APITestCase):
     payload = self.client.get(reverse('applications')).data
     self.assertEqual([a['id'] for a in payload['user_applications']], [application_id])
     self.assertEqual(
-      [(e['application'], e['to_status']) for e in payload['application_events']],
+      [(str(e['application']), e['to_status']) for e in payload['application_events']],
       [(application_id, 'a')],
     )
     # Candidate-safe shape: employer-internal notes never appear here.
@@ -456,8 +463,8 @@ class ApplicationTests(APITestCase):
     response = self._detail(application_id, user=self.employer)
     self.assertEqual(response.status_code, status.HTTP_200_OK)
     self.assertIsNotNone(Application.objects.get(pk=application_id).employer_viewed_at)
-    self.assertEqual(response.data['candidate']['id'], self.candidate.id)
-    self.assertEqual(response.data['job']['id'], self.job.id)
+    self.assertEqual(response.data['candidate']['id'], str(self.candidate.id))
+    self.assertEqual(response.data['job']['id'], str(self.job.id))
 
   # --- withdrawing ---
 
@@ -510,7 +517,7 @@ class ApplicationTests(APITestCase):
     dashboard = self.client.get(reverse('company_dashboard')).data
     self.assertEqual(len(dashboard['job_applicants']), 1)
     row = dashboard['job_applicants'][0]
-    self.assertEqual(row['candidate']['id'], self.candidate.id)
+    self.assertEqual(row['candidate']['id'], str(self.candidate.id))
     self.assertEqual(row['candidate']['first_name'], 'applicant')
     self.assertEqual(row['score'], 77)
     self.assertEqual(row['job'], self.job.id)
@@ -706,7 +713,7 @@ class InviteTests(APITestCase):
     self.assertEqual(self._invite(self.match, user=self.other_employer).status_code, status.HTTP_403_FORBIDDEN)
     self.assertEqual(self._invite(self.match, user=self.candidate).status_code, status.HTTP_403_FORBIDDEN)
     self.client.force_authenticate(user=self.employer)
-    self.assertEqual(self.client.patch(reverse('match_invite', args=[9999])).status_code, status.HTTP_404_NOT_FOUND)
+    self.assertEqual(self.client.patch(reverse('match_invite', args=[uuid.uuid4()])).status_code, status.HTTP_404_NOT_FOUND)
 
     self.match.refresh_from_db()
     self.assertFalse(self.match.is_invited)
@@ -816,8 +823,8 @@ class MessagingTests(APITestCase):
     response = self._start(self.invited, self.job_a)
 
     self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-    self.assertEqual(response.data['conversation']['job']['id'], self.job_a.id)
-    self.assertEqual(response.data['conversation']['counterpart']['id'], self.invited.id)
+    self.assertEqual(response.data['conversation']['job']['id'], str(self.job_a.id))
+    self.assertEqual(response.data['conversation']['counterpart']['id'], str(self.invited.id))
     self.assertEqual([m['body'] for m in response.data['messages']], ['Hello there'])
     self.assertTrue(Conversation.objects.filter(job=self.job_a, candidate=self.invited).exists())
 
@@ -872,7 +879,7 @@ class MessagingTests(APITestCase):
 
     thread = self._thread(conversation_id)
     self.assertEqual(thread.status_code, status.HTTP_200_OK)
-    self.assertEqual(thread.data['me'], self.invited.id)
+    self.assertEqual(thread.data['me'], str(self.invited.id))
     # The candidate sees the company as the counterpart, never the employer user.
     self.assertEqual(thread.data['conversation']['counterpart']['name'], 'alpha Ltd')
     self.assertEqual([m['body'] for m in thread.data['messages']], ['Hello there', 'Thanks, keen to talk'])
@@ -952,7 +959,7 @@ class MessagingTests(APITestCase):
     self._send(first_id, body='Bumping this')
 
     inbox = self._inbox().data
-    self.assertEqual(inbox['me'], self.employer_a.id)
+    self.assertEqual(inbox['me'], str(self.employer_a.id))
     self.assertEqual([c['id'] for c in inbox['conversations']][0], first_id)
     top = inbox['conversations'][0]
     self.assertEqual(top['counterpart']['name'], 'invited Candidate')
@@ -1032,7 +1039,7 @@ class MessagingTests(APITestCase):
     self.client.force_authenticate(user=self.invited)
     counterpart = self._thread(conversation_id).data['conversation']['counterpart']
     self.assertEqual(counterpart, {
-      'id': self.company_a.id, 'name': 'alpha Soho', 'photo': 'https://img/soho.png',
+      'id': str(self.company_a.id), 'name': 'alpha Soho', 'photo': 'https://img/soho.png',
       'subtitle': 'Soho', 'company_name': 'alpha Ltd',
     })
     inbox = self._inbox().data['conversations']
@@ -1288,10 +1295,10 @@ class RoleSeparationTests(APITestCase):
     ('get', 'company_branches', ()),   # used to 500 (uncaught DoesNotExist)
     ('post', 'company_branches', ()),
     ('post', 'jobs', ()),              # used to 500 (uncaught DoesNotExist)
-    ('patch', 'match_invite', (1,)),
-    ('get', 'candidate_profile', (1,)),
+    ('patch', 'match_invite', (ANY_ID,)),
+    ('get', 'candidate_profile', (ANY_ID,)),
     ('post', 'company_saved_candidates', ()),
-    ('patch', 'company_saved_candidate_details', (1,)),
+    ('patch', 'company_saved_candidate_details', (ANY_ID,)),
     ('post', 'conversations', ()),
   )
 
@@ -1299,7 +1306,7 @@ class RoleSeparationTests(APITestCase):
     ('get', 'user_dashboard', ()),
     ('get', 'user_work_experiences', ()),
     ('post', 'user_work_experiences', ()),
-    ('get', 'user_work_experience_details', (1,)),
+    ('get', 'user_work_experience_details', (ANY_ID,)),
     ('get', 'user_preferences', ()),
     ('get', 'saved_jobs', ()),
     ('post', 'saved_jobs', ()),

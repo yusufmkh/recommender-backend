@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 from django.db.models.functions import Lower
 from django.contrib.auth import get_user_model
@@ -43,6 +45,17 @@ ATTACHMENT_OPTIONS = (
   ('url', 'URL'),
 )
 
+class BaseModel(models.Model):
+  # Every table gets a random UUID primary key (never a guessable, enumerable
+  # integer that leaks row counts) plus the two audit timestamps. Declared once
+  # here rather than per model; DEFAULT_AUTO_FIELD cannot express a UUIDField.
+  id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+  created_at = models.DateTimeField(auto_now_add=True)
+  updated_at = models.DateTimeField(auto_now=True)
+
+  class Meta:
+    abstract = True
+
 class MyUserManager(BaseUserManager):
   def create_user(self, email, user_name, first_name, last_name, password, **other_fields):
     if not email:
@@ -62,7 +75,7 @@ class MyUserManager(BaseUserManager):
 
     return self.create_user(email, user_name, first_name, last_name, password, **other_fields)
 
-class MyUser(AbstractBaseUser, PermissionsMixin):
+class MyUser(BaseModel, AbstractBaseUser, PermissionsMixin):
   first_name = models.CharField(max_length=100)
   last_name = models.CharField(max_length=100)
   email = models.EmailField(max_length=300, unique=True)
@@ -89,8 +102,6 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   # holds a requested new address until its verification link is clicked.
   email_notifications = models.BooleanField(default=True)
   pending_email = models.EmailField(max_length=300, blank=True, default='')
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   objects = MyUserManager()
 
@@ -100,7 +111,7 @@ class MyUser(AbstractBaseUser, PermissionsMixin):
   def __str__(self):
     return self.user_name
   
-class Company(models.Model):
+class Company(BaseModel):
   # PROTECT (was DO_NOTHING, which SQLite turned into a commit-time FK error):
   # deleting an employer user fails cleanly until their Company goes first.
   user = models.OneToOneField(get_user_model(), related_name="company", on_delete=models.PROTECT)
@@ -120,8 +131,6 @@ class Company(models.Model):
   city = models.CharField(max_length=100)
   state = models.CharField(max_length=100)
   country = models.CharField(max_length=100)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   def clean(self):
     # Belt-and-braces for the admin (DRF writes skip full_clean): a Company
@@ -135,7 +144,7 @@ class Company(models.Model):
 def get_company_name():
   return Company.objects.get('name')
 
-class CompanyBranch(models.Model):
+class CompanyBranch(BaseModel):
   company = models.ForeignKey(Company, related_name='branches', on_delete=models.CASCADE)
   name = models.CharField(max_length=100)
   photo = models.CharField(max_length=500, blank=True)
@@ -146,16 +155,12 @@ class CompanyBranch(models.Model):
   city = models.CharField(max_length=100)
   state = models.CharField(max_length=100)
   country = models.CharField(max_length=100)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   def __str__(self):
     return f"{self.company.name} - {self.name}"
 
-class Skill(models.Model):
+class Skill(BaseModel):
   name = models.CharField(max_length=100, unique=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   class Meta:
     constraints = [
@@ -167,7 +172,7 @@ class Skill(models.Model):
   def __str__(self):
     return self.name
 
-class Job(models.Model):
+class Job(BaseModel):
   company = models.ForeignKey(Company, related_name='jobs', on_delete=models.CASCADE, null=True)
   branch = models.ForeignKey(CompanyBranch, related_name='jobs', on_delete=models.SET_NULL, null=True, blank=True)
   skills = models.ManyToManyField(Skill, related_name='jobs')
@@ -186,13 +191,11 @@ class Job(models.Model):
     default='a'
     )
   contact = models.CharField(max_length=100, null=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
   
   def __str__(self):
     return self.title
 
-class WorkExperience(models.Model):
+class WorkExperience(BaseModel):
   user = models.ForeignKey(get_user_model(), related_name='work_experiences', on_delete=models.CASCADE)
   company = models.ForeignKey(Company, related_name='work_experiences', on_delete=models.SET(get_company_name), blank=True, null=True, default=None)
   skills = models.ManyToManyField(Skill, related_name='work_experiences')
@@ -203,13 +206,11 @@ class WorkExperience(models.Model):
   company_website = models.CharField(max_length=100, blank=True, null=True, default=None)
   start_date = models.DateField()
   end_date = models.DateField(blank=True, null=True, default=None)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   def __str__(self):
     return self.user.first_name + ' - ' + self.job_title
 
-class Preference(models.Model):
+class Preference(BaseModel):
   user = models.OneToOneField(get_user_model(), related_name='preferences', on_delete=models.CASCADE)
   job_type = models.CharField(max_length=200, null=True)
   company_size = models.CharField(
@@ -222,24 +223,20 @@ class Preference(models.Model):
     choices=PAY_RANGE_OPTIONS,
     default='pay20_30'
     )
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   def __str__(self):
     return self.user.first_name
 
-class SavedJob(models.Model):
+class SavedJob(BaseModel):
   user = models.ForeignKey(get_user_model(), related_name='saved_jobs', on_delete=models.CASCADE)
   job = models.ForeignKey(Job, related_name='saved_jobs', on_delete=models.CASCADE)
 
-class SavedCandidate(models.Model):
+class SavedCandidate(BaseModel):
   # A company's shortlist. One row per candidate - saving is per-company; 
   # the roles they matched or were invited to come from Match
   company = models.ForeignKey(Company, related_name='saved_candidates', on_delete=models.CASCADE)
   user = models.ForeignKey(get_user_model(), related_name='saved_candidates', on_delete=models.CASCADE)
   note = models.TextField(blank=True, default='')
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   class Meta:
     ordering = ['-created_at']
@@ -252,16 +249,14 @@ class SavedCandidate(models.Model):
   def __str__(self):
     return f"{self.company.name} - {self.user.user_name}"
 
-class Match(models.Model):
+class Match(BaseModel):
   user = models.ForeignKey(get_user_model(), related_name='matches', on_delete=models.CASCADE)
   job = models.ForeignKey(Job, related_name='matches', on_delete=models.CASCADE)
   is_invited = models.BooleanField(default=False)
   # Recommender match score (0-100). Null until a score is generated.
   score = models.FloatField(null=True, blank=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
-class Application(models.Model):
+class Application(BaseModel):
   user = models.ForeignKey(get_user_model(), related_name='applications', on_delete=models.CASCADE)
   job = models.ForeignKey(Job, related_name='applications', on_delete=models.CASCADE)
   status = models.CharField(
@@ -274,8 +269,6 @@ class Application(models.Model):
   # Set the first time the job's employer opens the application - drives the
   # "new applicant" indicator without any notification infrastructure.
   employer_viewed_at = models.DateTimeField(null=True, blank=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   class Meta:
     ordering = ['-created_at']
@@ -290,7 +283,7 @@ class Application(models.Model):
   def __str__(self):
     return f"{self.user.user_name} - {self.job.title} ({self.status})"
 
-class ApplicationEvent(models.Model):
+class ApplicationEvent(BaseModel):
   # Append-only audit trail of an application's lifecycle: one row per status
   # change (including the initial apply), so the candidate timeline can date
   # every stage and employers can see who moved a candidate and when.
@@ -302,20 +295,19 @@ class ApplicationEvent(models.Model):
   # Employer-internal note (e.g. a rejection reason). Never serialized to the
   # candidate - see ApplicationEventSerializer vs its employer variant.
   note = models.TextField(blank=True, default='')
-  created_at = models.DateTimeField(auto_now_add=True)
 
   class Meta:
     ordering = ['created_at']
 
-class ApplicationQuestion(models.Model):
+class ApplicationQuestion(BaseModel):
   application = models.ForeignKey(Application, related_name='application_questions', on_delete=models.CASCADE)
   question = models.CharField(max_length=200)
 
-class ApplicationAnswer(models.Model):
+class ApplicationAnswer(BaseModel):
   application_question = models.OneToOneField(ApplicationQuestion, related_name='application_answer', on_delete=models.CASCADE)
   answer = models.CharField(max_length=300)
 
-class AttachmentRequirement(models.Model):
+class AttachmentRequirement(BaseModel):
   application = models.ForeignKey(Application, related_name='attachment_requirements', on_delete=models.CASCADE)
   attachment_requirement = models.CharField(max_length=200)
   attachment_type = models.CharField(
@@ -324,11 +316,11 @@ class AttachmentRequirement(models.Model):
     default='file'
     )
 
-class AttachmentAnswer(models.Model):
+class AttachmentAnswer(BaseModel):
   attachment_requirement = models.OneToOneField(AttachmentRequirement, related_name='attachment_answer', on_delete=models.CASCADE)
   attachment = models.CharField(max_length=500)
 
-class Conversation(models.Model):
+class Conversation(BaseModel):
   # One message thread between a candidate and the company owning `job`. Only
   # the employer may create one (together with its first message), and only when
   # the candidate was invited to the job or applied to it - so a conversation's
@@ -340,8 +332,6 @@ class Conversation(models.Model):
   # side sent it after this timestamp (null = that side has never opened it).
   candidate_last_read_at = models.DateTimeField(null=True, blank=True)
   employer_last_read_at = models.DateTimeField(null=True, blank=True)
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   class Meta:
     constraints = [
@@ -350,17 +340,18 @@ class Conversation(models.Model):
       models.UniqueConstraint(fields=['job', 'candidate'], name='unique_conversation_per_job_candidate'),
     ]
 
-class Message(models.Model):
+class Message(BaseModel):
   conversation = models.ForeignKey(Conversation, related_name='messages', on_delete=models.CASCADE)
   sender = models.ForeignKey(get_user_model(), related_name='sent_messages', on_delete=models.CASCADE)
   body = models.TextField()
-  created_at = models.DateTimeField(auto_now_add=True)
-  updated_at = models.DateTimeField(auto_now=True)
 
   class Meta:
-    ordering = ['created_at']
+    # The id tiebreak gives a total order: the thread poller's `after` cursor
+    # (see views._thread_payload) relies on it when two messages share a
+    # timestamp. Ids are random UUIDs, so created_at carries the chronology.
+    ordering = ['created_at', 'id']
     indexes = [models.Index(fields=['conversation', 'created_at'])]
 
-class MessageFile(models.Model):
+class MessageFile(BaseModel):
   message = models.ForeignKey(Message, related_name='message_files', on_delete=models.CASCADE)
   file_link = models.CharField(max_length=500)

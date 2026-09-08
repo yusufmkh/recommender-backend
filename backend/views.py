@@ -1,6 +1,8 @@
+import uuid
+
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F, Max, Q
+from django.db.models import Count, F, OuterRef, Q, Subquery
 from django.contrib.auth.tokens import default_token_generator
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -43,7 +45,16 @@ def _delete_old_photo_if_replaced(old_photo, new_photo):
 def _user_from_uid(uid):
   try:
     return MyUser.objects.get(pk=force_str(urlsafe_base64_decode(uid)))
-  except (MyUser.DoesNotExist, ValueError, TypeError, OverflowError):
+  except (MyUser.DoesNotExist, DjangoValidationError, ValueError, TypeError, OverflowError):
+    return None
+
+def _parse_uuid(value):
+  # Client-supplied ids arrive as strings (or worse). Validate them here rather
+  # than letting UUIDField do it inside a query: it raises ValidationError, not
+  # ValueError, so an unparsed id would turn a 400 into a 500.
+  try:
+    return uuid.UUID(str(value))
+  except (TypeError, ValueError, AttributeError):
     return None
 
 def _company_candidates(company):
@@ -676,8 +687,11 @@ def jobs(request, format=None):
     job_data = request.data.dict() if hasattr(request.data, 'dict') else dict(request.data)
     job_skills = job_data.pop('skills', [])
 
-    branch_id = job_data.pop('branch', None) or None
-    if branch_id is not None and not CompanyBranch.objects.filter(pk=branch_id, company=company).exists():
+    branch_raw = job_data.pop('branch', None) or None
+    branch_id = _parse_uuid(branch_raw) if branch_raw is not None else None
+    if branch_raw is not None and (
+      branch_id is None or not CompanyBranch.objects.filter(pk=branch_id, company=company).exists()
+    ):
       return Response({'error': 'Branch does not belong to your company.'}, status=status.HTTP_400_BAD_REQUEST)
 
     job = Job.objects.create(company=company, branch_id=branch_id, **job_data)
@@ -711,8 +725,11 @@ def job_details(request, id, format=None):
     job_skills = job_data.pop('skills', None)
 
     if 'branch' in job_data:
-      branch_id = job_data.pop('branch') or None
-      if branch_id is not None and not CompanyBranch.objects.filter(pk=branch_id, company=job.company).exists():
+      branch_raw = job_data.pop('branch') or None
+      branch_id = _parse_uuid(branch_raw) if branch_raw is not None else None
+      if branch_raw is not None and (
+        branch_id is None or not CompanyBranch.objects.filter(pk=branch_id, company=job.company).exists()
+      ):
         return Response({'error': 'Branch does not belong to your company.'}, status=status.HTTP_400_BAD_REQUEST)
       job.branch_id = branch_id
 
@@ -757,8 +774,8 @@ def company_saved_candidates(request):
   # so one employer can't read or write another's shortlist.
   company = company_for(request.user)
 
-  candidate_id = request.data.get('user')
-  if not candidate_id:
+  candidate_id = _parse_uuid(request.data.get('user'))
+  if candidate_id is None:
     return Response({'error': 'user is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
   if not _company_can_view_candidate(request.user, candidate_id):
@@ -883,9 +900,8 @@ def job_applications(request):
 
   elif request.method == 'POST':
     body = request.data
-    try:
-      job_id = int(body.get('job'))
-    except (TypeError, ValueError):
+    job_id = _parse_uuid(body.get('job'))
+    if job_id is None:
       return Response({'error': 'job is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
     cover_letter = body.get('cover_letter') or ''
@@ -1118,7 +1134,9 @@ def _clean_message_body(raw):
   return body, None
 
 def _job_summary(job):
-  return {'id': job.id, 'title': job.title, 'status': job.status}
+  # Ids are stringified here and in the other hand-built payloads so they match
+  # what the serializers emit (DRF renders UUIDField as str).
+  return {'id': str(job.id), 'title': job.title, 'status': job.status}
 
 def _conversation_counterpart(conversation, role):
   # The other side of the thread, shaped identically for both roles so the
@@ -1136,19 +1154,19 @@ def _conversation_counterpart(conversation, role):
     if job.branch_id:
       branch = job.branch
       return {
-        'id': company.id,
+        'id': str(company.id),
         'name': branch.name,
         'photo': branch.photo or company.photo,
         'subtitle': branch.city,
         'company_name': company.name,
       }
     return {
-      'id': company.id, 'name': company.name, 'photo': company.photo, 'subtitle': company.city,
+      'id': str(company.id), 'name': company.name, 'photo': company.photo, 'subtitle': company.city,
       'company_name': company.name,
     }
   candidate = conversation.candidate
   return {
-    'id': candidate.id,
+    'id': str(candidate.id),
     'name': f'{candidate.first_name} {candidate.last_name}'.strip(),
     'photo': candidate.photo,
     'subtitle': candidate.city,
@@ -1157,13 +1175,20 @@ def _conversation_counterpart(conversation, role):
 def _thread_payload(conversation, user, role, after_id=None):
   messages = conversation.messages.all()
   if after_id is not None:
-    # Ids are monotonic and messages append-only, so id-gt matches the
-    # created_at ordering and gives the poller a cheap incremental cursor.
-    messages = messages.filter(pk__gt=after_id)
+    # The poller sends the last message id it has. Ids are random UUIDs, so the
+    # cursor is resolved to that message's position in the (created_at, id)
+    # order - the same order Message.Meta emits - and everything after it is
+    # returned. An id that isn't in this thread (deleted, or never was) falls
+    # back to the full thread rather than erroring the poll loop.
+    after = conversation.messages.filter(pk=after_id).only('id', 'created_at').first()
+    if after is not None:
+      messages = messages.filter(
+        Q(created_at__gt=after.created_at) | Q(created_at=after.created_at, id__gt=after.id)
+      )
   return {
-    'me': user.id,
+    'me': str(user.id),
     'conversation': {
-      'id': conversation.id,
+      'id': str(conversation.id),
       'job': _job_summary(conversation.job),
       'counterpart': _conversation_counterpart(conversation, role),
     },
@@ -1200,18 +1225,23 @@ def _unread_by_conversation(user, conversations):
 @throttle_classes([PostScopedRateThrottle])
 def conversations(request, format=None):
   if request.method == 'GET':
-    convs = list(_member_conversations(request.user).select_related('job__company', 'job__branch', 'candidate'))
-    conv_ids = [c.id for c in convs]
-
-    # Latest message per thread in two flat queries (ids, then rows), plus two
-    # for unread counts - the inbox stays at five queries however long it gets.
-    last_ids = (
-      Message.objects.filter(conversation_id__in=conv_ids)
-      .values('conversation_id').annotate(last_id=Max('id'))
-    ) if conv_ids else []
+    # Latest message per thread comes from a correlated subquery on the
+    # conversation rows (ids are random UUIDs, so Max('id') would pick an
+    # arbitrary message), then one flat fetch of those rows, plus two queries
+    # for unread counts - the inbox stays at four queries however long it gets.
+    latest_message = (
+      Message.objects.filter(conversation=OuterRef('pk'))
+      .order_by('-created_at', '-id')
+      .values('pk')[:1]
+    )
+    convs = list(
+      _member_conversations(request.user)
+      .select_related('job__company', 'job__branch', 'candidate')
+      .annotate(last_message_id=Subquery(latest_message))
+    )
     last_by_conv = {
       m.conversation_id: m
-      for m in Message.objects.filter(pk__in=[row['last_id'] for row in last_ids])
+      for m in Message.objects.filter(pk__in=[c.last_message_id for c in convs if c.last_message_id])
     }
     unread = _unread_by_conversation(request.user, convs)
 
@@ -1226,23 +1256,22 @@ def conversations(request, format=None):
       role = _conversation_role(conversation, request.user)
       last = last_by_conv.get(conversation.id)
       summaries.append({
-        'id': conversation.id,
+        'id': str(conversation.id),
         'job': _job_summary(conversation.job),
         'counterpart': _conversation_counterpart(conversation, role),
         'last_message': MessageSerializer(last).data if last else None,
         'unread_count': unread.get(conversation.id, 0),
       })
 
-    return Response({'me': request.user.id, 'conversations': summaries})
+    return Response({'me': str(request.user.id), 'conversations': summaries})
 
   elif request.method == 'POST':
     # Employer-only: opening a thread requires owning the job, so a candidate
     # body fails the gate below. The first message travels in the same request
     # (and transaction) - threads are never born empty.
-    try:
-      candidate_id = int(request.data.get('candidate'))
-      job_id = int(request.data.get('job'))
-    except (TypeError, ValueError):
+    candidate_id = _parse_uuid(request.data.get('candidate'))
+    job_id = _parse_uuid(request.data.get('job'))
+    if candidate_id is None or job_id is None:
       return Response({'error': 'candidate and job ids are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
     body, error = _clean_message_body(request.data.get('body'))
@@ -1286,9 +1315,8 @@ def conversation_details(request, id, format=None):
   after_id = None
   after_raw = request.query_params.get('after')
   if after_raw is not None:
-    try:
-      after_id = int(after_raw)
-    except (TypeError, ValueError):
+    after_id = _parse_uuid(after_raw)
+    if after_id is None:
       return Response({'error': 'after must be a message id.'}, status=status.HTTP_400_BAD_REQUEST)
 
   role = _conversation_role(conversation, request.user)
